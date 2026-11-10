@@ -37,15 +37,26 @@ func serve(udpConn *net.UDPConn) {
 			break
 		}
 
-		receivedData := string(buf[:size])
-		fmt.Printf("Received %d bytes from %s: %s\n", size, source, receivedData)
+		fmt.Printf("Received %d bytes from %s\n", size, source)
 
-		// Create an empty response
-		response := []byte{}
+		response := respond(buf[:size])
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
 			fmt.Println("Failed to send response:", err)
 		}
 	}
+}
+
+// respond returns the wire format of the reply to a query packet. The query
+// is not inspected yet: every reply is the same header-only message.
+func respond(query []byte) []byte {
+	response := Message{
+		Header: Header{
+			ID: 1234,
+			QR: true,
+		},
+	}
+
+	return response.Encode()
 }
