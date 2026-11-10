@@ -315,6 +315,143 @@ func TestQuestionAppendToRejectsInvalidName(t *testing.T) {
 	}
 }
 
+func TestResourceRecordAppendTo(t *testing.T) {
+	tests := []struct {
+		name   string
+		record ResourceRecord
+		want   []byte
+	}{
+		{
+			name:   "A record of codecrafters.io",
+			record: ResourceRecord{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			want: concat(
+				[]byte("\x0ccodecrafters\x02io\x00"),
+				[]byte{0x00, 0x01},             // TYPE: A
+				[]byte{0x00, 0x01},             // CLASS: IN
+				[]byte{0x00, 0x00, 0x00, 0x3C}, // TTL: 60
+				[]byte{0x00, 0x04},             // RDLENGTH: 4
+				[]byte{0x08, 0x08, 0x08, 0x08}, // RDATA: 8.8.8.8
+			),
+		},
+		{
+			name:   "type, class and TTL are big-endian",
+			record: ResourceRecord{Name: "a.io", Type: 0x0102, Class: 0x0304, TTL: 0x05060708, Data: []byte{0xFF}},
+			want: concat(
+				[]byte("\x01a\x02io\x00"),
+				[]byte{0x01, 0x02},
+				[]byte{0x03, 0x04},
+				[]byte{0x05, 0x06, 0x07, 0x08},
+				[]byte{0x00, 0x01},
+				[]byte{0xFF},
+			),
+		},
+		{
+			name:   "largest TTL",
+			record: ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 0xFFFFFFFF, Data: []byte{1, 2, 3, 4}},
+			want: concat(
+				[]byte("\x01a\x02io\x00"),
+				[]byte{0x00, 0x01},
+				[]byte{0x00, 0x01},
+				[]byte{0xFF, 0xFF, 0xFF, 0xFF},
+				[]byte{0x00, 0x04},
+				[]byte{0x01, 0x02, 0x03, 0x04},
+			),
+		},
+		{
+			name:   "RDLENGTH is zero without data",
+			record: ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1},
+			want: concat(
+				[]byte("\x01a\x02io\x00"),
+				[]byte{0x00, 0x01},
+				[]byte{0x00, 0x01},
+				[]byte{0x00, 0x00, 0x00, 0x01},
+				[]byte{0x00, 0x00},
+			),
+		},
+		{
+			name:   "RDLENGTH is big-endian",
+			record: ResourceRecord{Name: "", Type: 16, Class: ClassIN, Data: bytes.Repeat([]byte{0xAB}, 0x0102)},
+			want: concat(
+				[]byte{0x00},
+				[]byte{0x00, 0x10},
+				[]byte{0x00, 0x01},
+				[]byte{0x00, 0x00, 0x00, 0x00},
+				[]byte{0x01, 0x02},
+				bytes.Repeat([]byte{0xAB}, 0x0102),
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.record.appendTo(nil)
+			if err != nil {
+				t.Fatalf("appendTo(nil) returned an error: %v", err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("appendTo(nil) = % x, want % x", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResourceRecordAppendToKeepsExistingBytes(t *testing.T) {
+	prefix := []byte{0xAA, 0xBB}
+	record := ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}}
+
+	got, err := record.appendTo(prefix)
+	if err != nil {
+		t.Fatalf("appendTo(prefix) returned an error: %v", err)
+	}
+
+	want := []byte("\xAA\xBB\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08")
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("appendTo(prefix) = % x, want % x", got, want)
+	}
+}
+
+func TestResourceRecordAppendToLargestData(t *testing.T) {
+	record := ResourceRecord{Name: "a.io", Type: 16, Class: ClassIN, Data: make([]byte, 65535)}
+
+	got, err := record.appendTo(nil)
+	if err != nil {
+		t.Fatalf("appendTo(nil) returned an error for data of the maximum length: %v", err)
+	}
+
+	// name (6) + type (2) + class (2) + TTL (4) precede RDLENGTH.
+	if rdlength := got[14:16]; !bytes.Equal(rdlength, []byte{0xFF, 0xFF}) {
+		t.Errorf("RDLENGTH = % x, want ff ff", rdlength)
+	}
+	if len(got) != 16+65535 {
+		t.Errorf("encoded record is %d bytes, want %d", len(got), 16+65535)
+	}
+}
+
+func TestResourceRecordAppendToRejectsInvalidRecords(t *testing.T) {
+	tests := []struct {
+		name   string
+		record ResourceRecord
+	}{
+		{
+			name:   "data one byte over what RDLENGTH can count",
+			record: ResourceRecord{Name: "a.io", Type: 16, Class: ClassIN, Data: make([]byte, 65536)},
+		},
+		{
+			name:   "invalid name",
+			record: ResourceRecord{Name: "a..io", Type: TypeA, Class: ClassIN, Data: []byte{8, 8, 8, 8}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := tt.record.appendTo(nil); err == nil {
+				t.Errorf("appendTo(nil) returned %d bytes, want an error", len(got))
+			}
+		})
+	}
+}
+
 func TestMessageEncode(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -368,6 +505,60 @@ func TestMessageEncode(t *testing.T) {
 			message: Message{Header: Header{ID: 1, QDCount: 7}},
 			want:    []byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
+		{
+			name: "header, question and answer",
+			message: Message{
+				Header:    Header{ID: 1234, QR: true},
+				Questions: []Question{{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}},
+				Answers: []ResourceRecord{
+					{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+				},
+			},
+			want: concat(
+				[]byte{0x04, 0xD2, 0x80, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08"),
+			),
+		},
+		{
+			name: "answers follow the questions and are encoded in order",
+			message: Message{
+				Header: Header{ID: 0xBEEF, QR: true},
+				Questions: []Question{
+					{Name: "a.io", Type: TypeA, Class: ClassIN},
+					{Name: "b.io", Type: TypeA, Class: ClassIN},
+				},
+				Answers: []ResourceRecord{
+					{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1, Data: []byte{1, 1, 1, 1}},
+					{Name: "b.io", Type: TypeA, Class: ClassIN, TTL: 2, Data: []byte{2, 2, 2, 2}},
+				},
+			},
+			want: concat(
+				[]byte{0xBE, 0xEF, 0x80, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\x01b\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x01\x01\x01"),
+				[]byte("\x01b\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x02\x00\x04\x02\x02\x02\x02"),
+			),
+		},
+		{
+			name: "ANCOUNT comes from the answers, not from the header",
+			message: Message{
+				Header: Header{ID: 1, ANCount: 9},
+				Answers: []ResourceRecord{
+					{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1, Data: []byte{1, 1, 1, 1}},
+				},
+			},
+			want: concat(
+				[]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x01\x01\x01"),
+			),
+		},
+		{
+			name:    "ANCOUNT is zero without answers, whatever the header says",
+			message: Message{Header: Header{ID: 1, ANCount: 9}},
+			want:    []byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
 	}
 
 	for _, tt := range tests {
@@ -385,8 +576,9 @@ func TestMessageEncode(t *testing.T) {
 
 func TestMessageEncodeDoesNotModifyTheMessage(t *testing.T) {
 	message := Message{
-		Header:    Header{ID: 1, QDCount: 7},
+		Header:    Header{ID: 1, QDCount: 7, ANCount: 9},
 		Questions: []Question{{Name: "a.io", Type: TypeA, Class: ClassIN}},
+		Answers:   []ResourceRecord{{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1, Data: []byte{1, 1, 1, 1}}},
 	}
 
 	if _, err := message.Encode(); err != nil {
@@ -395,6 +587,9 @@ func TestMessageEncodeDoesNotModifyTheMessage(t *testing.T) {
 
 	if message.Header.QDCount != 7 {
 		t.Errorf("Encode() changed Header.QDCount to %d", message.Header.QDCount)
+	}
+	if message.Header.ANCount != 9 {
+		t.Errorf("Encode() changed Header.ANCount to %d", message.Header.ANCount)
 	}
 }
 
@@ -414,6 +609,26 @@ func TestMessageEncodeRejectsTooManyQuestions(t *testing.T) {
 
 	if _, err := message.Encode(); err == nil {
 		t.Error("Encode() accepted 65536 questions, which QDCOUNT cannot count")
+	}
+}
+
+func TestMessageEncodeRejectsInvalidAnswer(t *testing.T) {
+	message := Message{
+		Header:    Header{ID: 1234, QR: true},
+		Questions: []Question{{Name: "a.io", Type: TypeA, Class: ClassIN}},
+		Answers:   []ResourceRecord{{Name: "a..io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}}},
+	}
+
+	if got, err := message.Encode(); err == nil {
+		t.Errorf("Encode() = % x, want an error", got)
+	}
+}
+
+func TestMessageEncodeRejectsTooManyAnswers(t *testing.T) {
+	message := Message{Answers: make([]ResourceRecord, 65536)}
+
+	if _, err := message.Encode(); err == nil {
+		t.Error("Encode() accepted 65536 answers, which ANCOUNT cannot count")
 	}
 }
 

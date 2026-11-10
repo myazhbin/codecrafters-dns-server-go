@@ -54,7 +54,8 @@ func serve(udpConn *net.UDPConn) {
 
 // respond returns the wire format of the reply to a query packet. The query
 // is not inspected yet: every reply is the same message, a header followed by
-// a question about the A record of codecrafters.io.
+// a question about the A record of codecrafters.io and that record as the
+// answer.
 func respond(query []byte) ([]byte, error) {
 	response := Message{
 		Header: Header{
@@ -63,6 +64,9 @@ func respond(query []byte) ([]byte, error) {
 		},
 		Questions: []Question{
 			{Name: "codecrafters.io", Type: TypeA, Class: ClassIN},
+		},
+		Answers: []ResourceRecord{
+			{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
 		},
 	}
 

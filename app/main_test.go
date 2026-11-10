@@ -117,7 +117,7 @@ var codecraftersQuery = []byte{
 	0x00, 0x01, // QCLASS: IN
 }
 
-func TestServerRepliesWithHeaderAndQuestionSections(t *testing.T) {
+func TestServerRepliesWithHeaderQuestionAndAnswerSections(t *testing.T) {
 	client := dialTestServer(t, startTestServer(t))
 
 	got := exchange(t, client, codecraftersQuery)
@@ -126,14 +126,26 @@ func TestServerRepliesWithHeaderAndQuestionSections(t *testing.T) {
 		0x04, 0xD2, // ID: 1234
 		0x80, 0x00, // flags: QR set, everything else zero
 		0x00, 0x01, // QDCOUNT: 1
-		0x00, 0x00, // ANCOUNT: 0
+		0x00, 0x01, // ANCOUNT: 1
 		0x00, 0x00, // NSCOUNT: 0
 		0x00, 0x00, // ARCOUNT: 0
+
+		// Question section.
 		0x0C, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's',
 		0x02, 'i', 'o',
 		0x00,       // end of name
 		0x00, 0x01, // QTYPE: A
 		0x00, 0x01, // QCLASS: IN
+
+		// Answer section.
+		0x0C, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's',
+		0x02, 'i', 'o',
+		0x00,       // end of name
+		0x00, 0x01, // TYPE: A
+		0x00, 0x01, // CLASS: IN
+		0x00, 0x00, 0x00, 0x3C, // TTL: 60
+		0x00, 0x04, // RDLENGTH: 4
+		0x08, 0x08, 0x08, 0x08, // RDATA: 8.8.8.8
 	}
 
 	if !bytes.Equal(got, want) {

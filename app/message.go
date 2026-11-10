@@ -132,6 +132,39 @@ func (q Question) appendTo(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
+// ResourceRecord is an entry in the answer section of a DNS message (RFC 1035,
+// section 4.1.3).
+type ResourceRecord struct {
+	Name  string // Domain name the record belongs to, such as "codecrafters.io".
+	Type  uint16 // Type of the record, such as TypeA. It decides how Data is read.
+	Class uint16 // Class of the record, usually ClassIN.
+	TTL   uint32 // Number of seconds the record may be cached before asking again.
+	Data  []byte // Record data (RDATA). For an A record, the 4 bytes of an IPv4 address.
+}
+
+// appendTo appends the wire format of the record to buf and returns the
+// extended buffer. The length of the data (RDLENGTH) is written just before
+// the data itself.
+func (r ResourceRecord) appendTo(buf []byte) ([]byte, error) {
+	if len(r.Data) > math.MaxUint16 {
+		return nil, fmt.Errorf("record for %q has %d bytes of data, the limit is %d",
+			r.Name, len(r.Data), math.MaxUint16)
+	}
+
+	buf, err := appendName(buf, r.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	buf = binary.BigEndian.AppendUint16(buf, r.Type)
+	buf = binary.BigEndian.AppendUint16(buf, r.Class)
+	buf = binary.BigEndian.AppendUint32(buf, r.TTL)
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(r.Data)))
+	buf = append(buf, r.Data...)
+
+	return buf, nil
+}
+
 // appendName appends the wire format of a domain name to buf and returns the
 // extended buffer. A name is encoded as a sequence of labels, each one prefixed
 // with a byte holding its length, and ends with a zero byte:
@@ -168,30 +201,43 @@ func appendName(buf []byte, name string) ([]byte, error) {
 }
 
 // Message is a DNS message. Of its five sections (header, question, answer,
-// authority and additional) only the header and question are supported so far.
+// authority and additional) the authority and additional sections are not
+// supported yet.
 type Message struct {
 	Header    Header
 	Questions []Question
+	Answers   []ResourceRecord
 }
 
 // Encode returns the wire format of the message.
 //
-// QDCOUNT is taken from the number of questions in the message rather than
-// from Header.QDCount, so the header cannot disagree with the sections that
-// follow it.
+// QDCOUNT and ANCOUNT are taken from the number of questions and answers in
+// the message rather than from Header.QDCount and Header.ANCount, so the header
+// cannot disagree with the sections that follow it.
 func (m Message) Encode() ([]byte, error) {
 	if len(m.Questions) > math.MaxUint16 {
 		return nil, fmt.Errorf("message has %d questions, the limit is %d", len(m.Questions), math.MaxUint16)
 	}
+	if len(m.Answers) > math.MaxUint16 {
+		return nil, fmt.Errorf("message has %d answers, the limit is %d", len(m.Answers), math.MaxUint16)
+	}
 
 	header := m.Header
 	header.QDCount = uint16(len(m.Questions))
+	header.ANCount = uint16(len(m.Answers))
 
 	buf := header.appendTo(make([]byte, 0, 512))
 
+	var err error
+
 	for _, question := range m.Questions {
-		var err error
 		if buf, err = question.appendTo(buf); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, answer := range m.Answers {
+		if buf, err = answer.appendTo(buf); err != nil {
 			return nil, err
 		}
 	}
