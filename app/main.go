@@ -39,7 +39,11 @@ func serve(udpConn *net.UDPConn) {
 
 		fmt.Printf("Received %d bytes from %s\n", size, source)
 
-		response := respond(buf[:size])
+		response, err := respond(buf[:size])
+		if err != nil {
+			fmt.Println("Failed to build response:", err)
+			continue
+		}
 
 		_, err = udpConn.WriteToUDP(response, source)
 		if err != nil {
@@ -49,12 +53,16 @@ func serve(udpConn *net.UDPConn) {
 }
 
 // respond returns the wire format of the reply to a query packet. The query
-// is not inspected yet: every reply is the same header-only message.
-func respond(query []byte) []byte {
+// is not inspected yet: every reply is the same message, a header followed by
+// a question about the A record of codecrafters.io.
+func respond(query []byte) ([]byte, error) {
 	response := Message{
 		Header: Header{
 			ID: 1234,
 			QR: true,
+		},
+		Questions: []Question{
+			{Name: "codecrafters.io", Type: TypeA, Class: ClassIN},
 		},
 	}
 

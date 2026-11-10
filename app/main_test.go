@@ -117,7 +117,7 @@ var codecraftersQuery = []byte{
 	0x00, 0x01, // QCLASS: IN
 }
 
-func TestServerRepliesWithHeaderSection(t *testing.T) {
+func TestServerRepliesWithHeaderAndQuestionSections(t *testing.T) {
 	client := dialTestServer(t, startTestServer(t))
 
 	got := exchange(t, client, codecraftersQuery)
@@ -125,10 +125,15 @@ func TestServerRepliesWithHeaderSection(t *testing.T) {
 	want := []byte{
 		0x04, 0xD2, // ID: 1234
 		0x80, 0x00, // flags: QR set, everything else zero
-		0x00, 0x00, // QDCOUNT: 0
+		0x00, 0x01, // QDCOUNT: 1
 		0x00, 0x00, // ANCOUNT: 0
 		0x00, 0x00, // NSCOUNT: 0
 		0x00, 0x00, // ARCOUNT: 0
+		0x0C, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's',
+		0x02, 'i', 'o',
+		0x00,       // end of name
+		0x00, 0x01, // QTYPE: A
+		0x00, 0x01, // QCLASS: IN
 	}
 
 	if !bytes.Equal(got, want) {
