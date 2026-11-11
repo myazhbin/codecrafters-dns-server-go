@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -11,9 +13,17 @@ import (
 	"time"
 )
 
-// startTestServer runs serve on an ephemeral loopback port, so tests never
-// collide with a real server on port 2053, and returns the address it listens on.
+// startTestServer runs a server that makes its answers up, without an upstream
+// resolver, and returns the address it listens on.
 func startTestServer(t *testing.T) *net.UDPAddr {
+	t.Helper()
+
+	return startTestServerWith(t, &server{resolver: staticResolver{}, timeout: 2 * time.Second})
+}
+
+// startTestServerWith runs s on an ephemeral loopback port, so tests never
+// collide with a real server on port 2053, and returns the address it listens on.
+func startTestServerWith(t *testing.T, s *server) *net.UDPAddr {
 	t.Helper()
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -24,7 +34,7 @@ func startTestServer(t *testing.T) *net.UDPAddr {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serve(conn)
+		s.serve(conn)
 	}()
 
 	t.Cleanup(func() {
@@ -33,6 +43,14 @@ func startTestServer(t *testing.T) *net.UDPAddr {
 	})
 
 	return conn.LocalAddr().(*net.UDPAddr)
+}
+
+// respond returns the reply to packet of a server that makes its answers up,
+// without an upstream resolver.
+func respond(packet []byte) ([]byte, error) {
+	s := &server{resolver: staticResolver{}, timeout: 2 * time.Second}
+
+	return s.respond(context.Background(), packet)
 }
 
 // dialTestServer returns a UDP client connected to addr whose reads and writes
@@ -174,6 +192,71 @@ func TestServerRepliesToMultipleClients(t *testing.T) {
 	}
 }
 
+func TestServerKeepsQueriesThatArriveTogetherApart(t *testing.T) {
+	addr := startTestServer(t)
+
+	const clients, queriesPerClient = 8, 50
+
+	// Every client fires off its queries as fast as it can, so that the
+	// server is always busy with several of them at once.
+	failures := make(chan string, clients*queriesPerClient)
+	done := make(chan struct{})
+
+	for c := 0; c < clients; c++ {
+		client := dialTestServer(t, addr)
+
+		go func() {
+			defer func() { done <- struct{}{} }()
+
+			for q := 0; q < queriesPerClient; q++ {
+				id := uint16(c*1000 + q)
+				question := Question{Name: fmt.Sprintf("query-%d.client-%d.example", q, c), Type: TypeA, Class: ClassIN}
+
+				query, err := Message{Header: Header{ID: id}, Questions: []Question{question}}.Encode()
+				if err != nil {
+					failures <- fmt.Sprintf("client %d: failed to encode query %d: %v", c, q, err)
+					return
+				}
+				if _, err := client.Write(query); err != nil {
+					failures <- fmt.Sprintf("client %d: failed to send query %d: %v", c, q, err)
+					return
+				}
+
+				buf := make([]byte, 512)
+				n, err := client.Read(buf)
+				if err != nil {
+					failures <- fmt.Sprintf("client %d: no response to query %d: %v", c, q, err)
+					return
+				}
+
+				response, err := parseMessage(buf[:n])
+				if err != nil {
+					failures <- fmt.Sprintf("client %d: response to query %d does not parse: %v", c, q, err)
+					return
+				}
+
+				// A reply that belongs to another query, or that is made up
+				// of pieces of two, has the wrong ID or the wrong name in it.
+				wantAnswer := ResourceRecord{Name: question.Name, Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}}
+				if response.Header.ID != id ||
+					!reflect.DeepEqual(response.Questions, []Question{question}) ||
+					!reflect.DeepEqual(response.Answers, []ResourceRecord{wantAnswer}) {
+					failures <- fmt.Sprintf("client %d: response to query %d about %q is %+v", c, q, question.Name, response)
+				}
+			}
+		}()
+	}
+
+	for c := 0; c < clients; c++ {
+		<-done
+	}
+	close(failures)
+
+	for failure := range failures {
+		t.Error(failure)
+	}
+}
+
 func TestServerRepliesWithHeaderQuestionAndAnswerSections(t *testing.T) {
 	client := dialTestServer(t, startTestServer(t))
 
@@ -259,10 +342,12 @@ func TestServeReturnsWhenConnectionIsClosed(t *testing.T) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 
+	s := &server{resolver: staticResolver{}, timeout: 2 * time.Second}
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serve(conn)
+		s.serve(conn)
 	}()
 
 	conn.Close()
@@ -861,4 +946,305 @@ func TestRespondRejectsPacketsItCannotAnswer(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stubResolver is a resolver that answers from a table, for tests of what the
+// server does with the outcome of resolving each question.
+type stubResolver struct {
+	// outcomes holds what resolve returns for a question, by name. A name
+	// that is not in it resolves to no answers and no error.
+	outcomes map[string]stubOutcome
+
+	// calls records every call to resolve, in order.
+	calls []stubCall
+}
+
+type stubOutcome struct {
+	resolution resolution
+	err        error
+}
+
+type stubCall struct {
+	question         Question
+	recursionDesired bool
+}
+
+func (r *stubResolver) resolve(_ context.Context, question Question, recursionDesired bool) (resolution, error) {
+	r.calls = append(r.calls, stubCall{question, recursionDesired})
+
+	outcome := r.outcomes[question.Name]
+
+	return outcome.resolution, outcome.err
+}
+
+func TestRespondPutsOutcomesOfQuestionsTogether(t *testing.T) {
+	const rcodeNameError, rcodeRefused = 3, 5
+
+	address := func(name string, last byte) ResourceRecord {
+		return ResourceRecord{Name: name, Type: TypeA, Class: ClassIN, TTL: 300, Data: []byte{10, 0, 0, last}}
+	}
+
+	outcomes := map[string]stubOutcome{
+		"one.example":       {resolution: resolution{Answers: []ResourceRecord{address("one.example", 1)}}},
+		"two.example":       {resolution: resolution{Answers: []ResourceRecord{address("two.example", 2), address("two.example", 3)}}},
+		"none.example":      {resolution: resolution{}},
+		"missing.example":   {resolution: resolution{RCode: rcodeNameError}},
+		"refused.example":   {resolution: resolution{RCode: rcodeRefused}},
+		"truncated.example": {resolution: resolution{Answers: []ResourceRecord{address("truncated.example", 4)}, Truncated: true}},
+		"broken.example":    {err: errors.New("no reply")},
+	}
+
+	tests := []struct {
+		name          string
+		names         []string
+		wantRCode     uint8
+		wantTruncated bool
+		wantAnswers   []ResourceRecord
+		wantResolved  []string // The questions that the resolver was asked.
+	}{
+		{
+			name:         "one question",
+			names:        []string{"one.example"},
+			wantAnswers:  []ResourceRecord{address("one.example", 1)},
+			wantResolved: []string{"one.example"},
+		},
+		{
+			name:         "answers follow the order of the questions",
+			names:        []string{"two.example", "one.example"},
+			wantAnswers:  []ResourceRecord{address("two.example", 2), address("two.example", 3), address("one.example", 1)},
+			wantResolved: []string{"two.example", "one.example"},
+		},
+		{
+			name:         "a question without answers leaves the others alone",
+			names:        []string{"one.example", "none.example", "two.example"},
+			wantAnswers:  []ResourceRecord{address("one.example", 1), address("two.example", 2), address("two.example", 3)},
+			wantResolved: []string{"one.example", "none.example", "two.example"},
+		},
+		{
+			name:         "the same question twice is resolved twice",
+			names:        []string{"one.example", "one.example"},
+			wantAnswers:  []ResourceRecord{address("one.example", 1), address("one.example", 1)},
+			wantResolved: []string{"one.example", "one.example"},
+		},
+		{
+			name:         "response code of the only question",
+			names:        []string{"missing.example"},
+			wantRCode:    rcodeNameError,
+			wantResolved: []string{"missing.example"},
+		},
+		{
+			name:         "a response code does not stop the questions after it",
+			names:        []string{"missing.example", "one.example"},
+			wantRCode:    rcodeNameError,
+			wantAnswers:  []ResourceRecord{address("one.example", 1)},
+			wantResolved: []string{"missing.example", "one.example"},
+		},
+		{
+			name:         "a response code is kept when an earlier question went well",
+			names:        []string{"one.example", "missing.example"},
+			wantRCode:    rcodeNameError,
+			wantAnswers:  []ResourceRecord{address("one.example", 1)},
+			wantResolved: []string{"one.example", "missing.example"},
+		},
+		{
+			name:         "the first of two response codes wins",
+			names:        []string{"refused.example", "missing.example"},
+			wantRCode:    rcodeRefused,
+			wantResolved: []string{"refused.example", "missing.example"},
+		},
+		{
+			name:         "the first of two response codes wins, the other way around",
+			names:        []string{"missing.example", "refused.example"},
+			wantRCode:    rcodeNameError,
+			wantResolved: []string{"missing.example", "refused.example"},
+		},
+		{
+			name:          "truncation of the only question",
+			names:         []string{"truncated.example"},
+			wantTruncated: true,
+			wantAnswers:   []ResourceRecord{address("truncated.example", 4)},
+			wantResolved:  []string{"truncated.example"},
+		},
+		{
+			name:          "truncation is kept when a later question is complete",
+			names:         []string{"truncated.example", "one.example"},
+			wantTruncated: true,
+			wantAnswers:   []ResourceRecord{address("truncated.example", 4), address("one.example", 1)},
+			wantResolved:  []string{"truncated.example", "one.example"},
+		},
+		{
+			name:          "truncation of a later question",
+			names:         []string{"one.example", "truncated.example"},
+			wantTruncated: true,
+			wantAnswers:   []ResourceRecord{address("one.example", 1), address("truncated.example", 4)},
+			wantResolved:  []string{"one.example", "truncated.example"},
+		},
+		{
+			name:         "failure of the only question",
+			names:        []string{"broken.example"},
+			wantRCode:    RCodeServerFailure,
+			wantResolved: []string{"broken.example"},
+		},
+		{
+			name:         "a failure throws away the answers so far",
+			names:        []string{"one.example", "broken.example"},
+			wantRCode:    RCodeServerFailure,
+			wantResolved: []string{"one.example", "broken.example"},
+		},
+		{
+			name:         "a failure stops the questions after it",
+			names:        []string{"broken.example", "one.example"},
+			wantRCode:    RCodeServerFailure,
+			wantResolved: []string{"broken.example"},
+		},
+		{
+			name:         "a failure wins over a response code and a truncation before it",
+			names:        []string{"missing.example", "truncated.example", "broken.example", "two.example"},
+			wantRCode:    RCodeServerFailure,
+			wantResolved: []string{"missing.example", "truncated.example", "broken.example"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &stubResolver{outcomes: outcomes}
+			s := &server{resolver: resolver, timeout: 2 * time.Second}
+
+			query := Message{Header: Header{ID: 21}}
+			for _, name := range tt.names {
+				query.Questions = append(query.Questions, Question{Name: name, Type: TypeA, Class: ClassIN})
+			}
+
+			response, err := s.respond(context.Background(), mustEncode(t, query))
+			if err != nil {
+				t.Fatalf("respond returned an error: %v", err)
+			}
+
+			got := mustParse(t, response)
+
+			want := Message{
+				Header: Header{
+					ID: 21, QR: true, TC: tt.wantTruncated, RCode: tt.wantRCode,
+					QDCount: uint16(len(query.Questions)), ANCount: uint16(len(tt.wantAnswers)),
+				},
+				Questions: query.Questions,
+				Answers:   tt.wantAnswers,
+			}
+
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("response = %+v, want %+v", got, want)
+			}
+
+			var resolved []string
+			for _, call := range resolver.calls {
+				resolved = append(resolved, call.question.Name)
+			}
+			if !reflect.DeepEqual(resolved, tt.wantResolved) {
+				t.Errorf("resolver was asked about %v, want %v", resolved, tt.wantResolved)
+			}
+		})
+	}
+}
+
+func TestRespondPassesQuestionAndRecursionDesiredToResolver(t *testing.T) {
+	const typeMX = 15
+
+	for _, recursionDesired := range []bool{false, true} {
+		resolver := &stubResolver{}
+		s := &server{resolver: resolver, timeout: 2 * time.Second}
+
+		questions := []Question{
+			{Name: "codecrafters.io", Type: TypeA, Class: ClassIN},
+			{Name: "example.com", Type: typeMX, Class: 3},
+		}
+
+		query := mustEncode(t, Message{Header: Header{ID: 1, RD: recursionDesired}, Questions: questions})
+
+		if _, err := s.respond(context.Background(), query); err != nil {
+			t.Fatalf("RD %t: respond returned an error: %v", recursionDesired, err)
+		}
+
+		want := []stubCall{
+			{question: questions[0], recursionDesired: recursionDesired},
+			{question: questions[1], recursionDesired: recursionDesired},
+		}
+
+		if !reflect.DeepEqual(resolver.calls, want) {
+			t.Errorf("RD %t: resolver was called with %+v, want %+v", recursionDesired, resolver.calls, want)
+		}
+	}
+}
+
+func TestRespondDoesNotResolveWhatItCannotAnswer(t *testing.T) {
+	tests := []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "query with an unsupported opcode", packet: queryWithHeader(t, Header{ID: 1, Opcode: 2})},
+		{name: "query that is cut short", packet: codecraftersQuery[:len(codecraftersQuery)-1]},
+		{name: "query whose second question is cut short", packet: concat(
+			[]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+			[]byte("\x01b\x02io\x00\x00\x01"),
+		)},
+		{name: "response", packet: queryWithHeader(t, Header{ID: 1, QR: true})},
+		{name: "packet without a header", packet: codecraftersQuery[:headerSize-1]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &stubResolver{}
+			s := &server{resolver: resolver, timeout: 2 * time.Second}
+
+			// Whether there is a reply or not is checked elsewhere.
+			s.respond(context.Background(), tt.packet)
+
+			if len(resolver.calls) != 0 {
+				t.Errorf("resolver was asked about %+v, want nothing", resolver.calls)
+			}
+		})
+	}
+}
+
+func TestRespondGivesResolverContextThatEndsWithTheQuery(t *testing.T) {
+	// A resolver that reports whether it was called with a live context.
+	var sawLiveContext, sawDeadline bool
+
+	s := &server{timeout: 2 * time.Second, resolver: resolverFunc(
+		func(ctx context.Context, question Question, recursionDesired bool) (resolution, error) {
+			sawLiveContext = ctx.Err() == nil
+			_, sawDeadline = ctx.Deadline()
+
+			return resolution{}, nil
+		},
+	)}
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer conn.Close()
+
+	client := dialTestServer(t, conn.LocalAddr().(*net.UDPAddr))
+
+	s.handle(context.Background(), conn, codecraftersQuery, client.LocalAddr().(*net.UDPAddr))
+
+	if !sawLiveContext {
+		t.Error("resolver was called with a context that had already ended")
+	}
+	if !sawDeadline {
+		t.Error("resolver was called with a context without a deadline")
+	}
+
+	// handle sent the reply to the client before it returned.
+	if _, err := client.Read(make([]byte, 512)); err != nil {
+		t.Errorf("no response received: %v", err)
+	}
+}
+
+// resolverFunc lets a function stand in for a resolver.
+type resolverFunc func(ctx context.Context, question Question, recursionDesired bool) (resolution, error)
+
+func (f resolverFunc) resolve(ctx context.Context, question Question, recursionDesired bool) (resolution, error) {
+	return f(ctx, question, recursionDesired)
 }

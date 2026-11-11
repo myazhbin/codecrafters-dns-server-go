@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
-	"strings"
 )
 
 // headerSize is the length in bytes of the header section, which is the same
@@ -69,12 +67,18 @@ const (
 const (
 	RCodeNoError        uint8 = 0 // No error condition.
 	RCodeFormatError    uint8 = 1 // The server was unable to interpret the query.
+	RCodeServerFailure  uint8 = 2 // The server was unable to process the query.
 	RCodeNotImplemented uint8 = 4 // The server does not support this kind of query.
 )
 
 // Record types (RFC 1035, section 3.2.2).
 const (
-	TypeA uint16 = 1 // An IPv4 host address.
+	TypeA     uint16 = 1  // An IPv4 host address.
+	TypeNS    uint16 = 2  // An authoritative name server.
+	TypeCNAME uint16 = 5  // The canonical name for an alias.
+	TypeSOA   uint16 = 6  // The start of a zone of authority.
+	TypePTR   uint16 = 12 // A domain name pointer.
+	TypeMX    uint16 = 15 // A mail exchange.
 )
 
 // Record classes (RFC 1035, section 3.2.4).
@@ -217,7 +221,11 @@ type ResourceRecord struct {
 	Type  uint16 // Type of the record, such as TypeA. It decides how Data is read.
 	Class uint16 // Class of the record, usually ClassIN.
 	TTL   uint32 // Number of seconds the record may be cached before asking again.
-	Data  []byte // Record data (RDATA). For an A record, the 4 bytes of an IPv4 address.
+
+	// Data is the record data (RDATA): for an A record, the 4 bytes of an IPv4
+	// address. Domain names in it are never compressed, because a pointer
+	// only means something inside the message it was read from.
+	Data []byte
 }
 
 // appendTo appends the wire format of the record to buf and returns the
@@ -243,6 +251,115 @@ func (r ResourceRecord) appendTo(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
+// parseResourceRecord decodes the record that starts at offset in the DNS
+// message data. It returns the record and the offset of the byte that follows
+// it.
+func parseResourceRecord(data []byte, offset int) (ResourceRecord, int, error) {
+	name, offset, err := parseName(data, offset)
+	if err != nil {
+		return ResourceRecord{}, 0, err
+	}
+
+	// The name is followed by the type (2 bytes), the class (2), the TTL (4)
+	// and the length of the data (2).
+	if len(data)-offset < 10 {
+		return ResourceRecord{}, 0, errors.New("message ends before the type, class, TTL and data length of the record")
+	}
+
+	record := ResourceRecord{
+		Name:  name,
+		Type:  binary.BigEndian.Uint16(data[offset:]),
+		Class: binary.BigEndian.Uint16(data[offset+2:]),
+		TTL:   binary.BigEndian.Uint32(data[offset+4:]),
+	}
+	length := int(binary.BigEndian.Uint16(data[offset+8:]))
+	offset += 10
+
+	if length > len(data)-offset {
+		return ResourceRecord{}, 0, errors.New("message ends in the middle of the data of the record")
+	}
+
+	record.Data, err = parseRecordData(data, offset, length, record.Type)
+	if err != nil {
+		return ResourceRecord{}, 0, err
+	}
+
+	return record, offset + length, nil
+}
+
+// domainName marks a domain name in the layouts of recordDataLayouts.
+const domainName = 0
+
+// recordDataLayouts describes the data of the record types that may have
+// compressed domain names in it. Those are the types defined in RFC 1035, and
+// no others (RFC 3597, section 4). The parts of the data are listed in order:
+// domainName stands for a domain name, any other value for that many bytes.
+var recordDataLayouts = map[uint16][]int{
+	TypeNS:    {domainName},
+	3:         {domainName}, // MD, a mail destination (obsolete).
+	4:         {domainName}, // MF, a mail forwarder (obsolete).
+	TypeCNAME: {domainName},
+	TypeSOA:   {domainName, domainName, 20}, // Primary server, mailbox, then five 32-bit numbers.
+	7:         {domainName},                 // MB, a mailbox domain name (experimental).
+	8:         {domainName},                 // MG, a mail group member (experimental).
+	9:         {domainName},                 // MR, a mail rename domain name (experimental).
+	TypePTR:   {domainName},
+	14:        {domainName, domainName}, // MINFO, mailbox information (experimental).
+	TypeMX:    {2, domainName},          // Preference, then the mail exchange.
+}
+
+// parseRecordData returns the data of a record of the given type, which takes
+// up length bytes at offset in the DNS message data.
+//
+// The data is returned as it is, except for the record types that may have
+// compressed domain names in it. Those names are written out in full, so that
+// the data still makes sense once it is taken out of this message.
+func parseRecordData(data []byte, offset, length int, recordType uint16) ([]byte, error) {
+	end := offset + length
+
+	layout, mayBeCompressed := recordDataLayouts[recordType]
+	if !mayBeCompressed {
+		return append([]byte(nil), data[offset:end]...), nil
+	}
+
+	var expanded []byte
+
+	for _, part := range layout {
+		if part != domainName {
+			if part > end-offset {
+				return nil, fmt.Errorf("data of record of type %d is cut short", recordType)
+			}
+
+			expanded = append(expanded, data[offset:offset+part]...)
+			offset += part
+
+			continue
+		}
+
+		name, next, err := parseName(data, offset)
+		if err != nil {
+			return nil, err
+		}
+
+		// What a pointer leads to may be anywhere earlier in the message,
+		// but the name itself has to stay within the data of its record.
+		if next > end {
+			return nil, fmt.Errorf("domain name in data of record of type %d runs past the end of the data", recordType)
+		}
+
+		if expanded, err = appendName(expanded, name); err != nil {
+			return nil, err
+		}
+		offset = next
+	}
+
+	if offset != end {
+		return nil, fmt.Errorf("data of record of type %d is %d bytes too long", recordType, end-offset)
+	}
+
+	return expanded, nil
+}
+
 // appendName appends the wire format of a domain name to buf and returns the
 // extended buffer. A name is encoded as a sequence of labels, each one prefixed
 // with a byte holding its length, and ends with a zero byte:
@@ -250,25 +367,68 @@ func (r ResourceRecord) appendTo(buf []byte) ([]byte, error) {
 //
 // A single trailing dot is accepted and ignored, so "google.com." encodes the
 // same way. Both "" and "." stand for the root, which is the zero byte alone.
+//
+// A backslash takes away the special meaning of the character after it, which
+// is how a label can hold a dot: `first\.last.example.com` has three labels.
+// A backslash followed by three decimal digits stands for the byte with that
+// value (RFC 1035, section 5.1).
 func appendName(buf []byte, name string) ([]byte, error) {
 	start := len(buf)
 
-	if labels := strings.TrimSuffix(name, "."); labels != "" {
-		for _, label := range strings.Split(labels, ".") {
-			if label == "" {
-				return nil, fmt.Errorf("domain name %q has an empty label", name)
-			}
-			if len(label) > maxLabelLength {
-				return nil, fmt.Errorf("domain name %q has a label of %d bytes, the limit is %d",
-					name, len(label), maxLabelLength)
-			}
-
-			buf = append(buf, byte(len(label)))
-			buf = append(buf, label...)
-		}
+	text := name
+	if text == "." {
+		text = ""
 	}
 
+	// The length of a label is written in front of it, but is only known once
+	// its end is reached. A byte is set aside for it in the meantime.
+	lengthAt := len(buf)
 	buf = append(buf, 0)
+
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+
+		switch c {
+		case '.':
+			length := len(buf) - lengthAt - 1
+			if length == 0 {
+				return nil, fmt.Errorf("domain name %q has an empty label", name)
+			}
+			if length > maxLabelLength {
+				return nil, fmt.Errorf("domain name %q has a label of %d bytes, the limit is %d",
+					name, length, maxLabelLength)
+			}
+
+			buf[lengthAt] = byte(length)
+			lengthAt = len(buf)
+			buf = append(buf, 0)
+
+			continue
+
+		case '\\':
+			escaped, size, err := unescape(text[i+1:])
+			if err != nil {
+				return nil, fmt.Errorf("domain name %q %w", name, err)
+			}
+
+			c = escaped
+			i += size
+		}
+
+		buf = append(buf, c)
+	}
+
+	// After a trailing dot, and in the root, there is no label left to end:
+	// the byte set aside for the next length is the zero that ends the name.
+	if length := len(buf) - lengthAt - 1; length > 0 {
+		if length > maxLabelLength {
+			return nil, fmt.Errorf("domain name %q has a label of %d bytes, the limit is %d",
+				name, length, maxLabelLength)
+		}
+
+		buf[lengthAt] = byte(length)
+		buf = append(buf, 0)
+	}
 
 	if encoded := len(buf) - start; encoded > maxNameLength {
 		return nil, fmt.Errorf("domain name %q takes %d bytes to encode, the limit is %d",
@@ -278,15 +438,51 @@ func appendName(buf []byte, name string) ([]byte, error) {
 	return buf, nil
 }
 
+// unescape decodes the escape sequence at the start of text, which is what
+// follows a backslash in a domain name. It returns the byte that the sequence
+// stands for and the number of bytes of text that the sequence takes up.
+func unescape(text string) (byte, int, error) {
+	if text == "" {
+		return 0, 0, errors.New("ends with a backslash that escapes nothing")
+	}
+
+	// Anything but a digit stands for itself.
+	if !isDigit(text[0]) {
+		return text[0], 1, nil
+	}
+
+	if len(text) < 3 || !isDigit(text[1]) || !isDigit(text[2]) {
+		return 0, 0, errors.New("has a decimal escape that is not three digits long")
+	}
+
+	value := int(text[0]-'0')*100 + int(text[1]-'0')*10 + int(text[2]-'0')
+	if value > math.MaxUint8 {
+		return 0, 0, fmt.Errorf("has a decimal escape for %d, which is not a byte", value)
+	}
+
+	return byte(value), 3, nil
+}
+
+// isDigit reports whether c is a decimal digit.
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
 // parseName decodes the domain name that starts at offset in the DNS message
 // data, following compression pointers to the rest of the name where there are
 // any. It returns the name and the offset of the byte that follows it.
 //
 // The labels of the name are joined with dots, without a trailing dot:
 // \x06google\x03com\x00 becomes "google.com". The root, which has no labels, is
-// returned as ".".
+// returned as ".". A dot or a backslash inside a label is preceded by a
+// backslash, which keeps it apart from the dots that separate labels and makes
+// the name one that appendName encodes back to the same labels.
 func parseName(data []byte, offset int) (string, int, error) {
 	var name []byte
+
+	// encoded is what the name takes to encode without compression. The zero
+	// byte that ends it is counted from the start.
+	encoded := 1
 
 	// start is where the run of labels being read begins.
 	start := offset
@@ -344,22 +540,19 @@ func parseName(data []byte, offset int) (string, int, error) {
 		label := data[offset : offset+length]
 		offset += length
 
-		// A dot inside a label could not be told apart from the dots that
-		// separate labels once the name is written as text.
-		if bytes.IndexByte(label, '.') >= 0 {
-			return "", 0, fmt.Errorf("domain name has a label that contains a dot: %q", label)
+		encoded += 1 + length
+		if encoded > maxNameLength {
+			return "", 0, fmt.Errorf("domain name takes more than %d bytes to encode", maxNameLength)
 		}
 
 		if len(name) > 0 {
 			name = append(name, '.')
 		}
-		name = append(name, label...)
-
-		// The text form is two bytes shorter than the uncompressed wire
-		// format, which has a length byte per label instead of the dots and
-		// a terminating zero.
-		if len(name)+2 > maxNameLength {
-			return "", 0, fmt.Errorf("domain name takes more than %d bytes to encode", maxNameLength)
+		for _, c := range label {
+			if c == '.' || c == '\\' {
+				name = append(name, '\\')
+			}
+			name = append(name, c)
 		}
 	}
 
@@ -376,7 +569,8 @@ func parseName(data []byte, offset int) (string, int, error) {
 
 // Message is a DNS message. Of its five sections (header, question, answer,
 // authority and additional) the authority and additional sections are not
-// supported yet.
+// supported: they are skipped when a message is decoded and left empty when
+// one is encoded.
 type Message struct {
 	Header    Header
 	Questions []Question
@@ -386,9 +580,10 @@ type Message struct {
 // Encode returns the wire format of the message, however long that is. Domain
 // names are written out in full, without compression.
 //
-// QDCOUNT and ANCOUNT are taken from the number of questions and answers in
-// the message rather than from Header.QDCount and Header.ANCount, so the header
-// cannot disagree with the sections that follow it.
+// The four counts in the encoded header describe what is actually encoded, not
+// what the counts in Header say, so the header cannot disagree with the
+// sections that follow it: QDCOUNT and ANCOUNT are the number of questions and
+// answers in the message, and NSCOUNT and ARCOUNT are zero.
 func (m Message) Encode() ([]byte, error) {
 	return m.EncodeWithLimit(math.MaxInt)
 }
@@ -449,6 +644,8 @@ func (m Message) EncodeWithLimit(limit int) ([]byte, error) {
 	header := m.Header
 	header.QDCount = uint16(questions)
 	header.ANCount = uint16(answers)
+	header.NSCount = 0
+	header.ARCount = 0
 	header.TC = header.TC || !complete
 
 	copy(buf, header.appendTo(nil))
@@ -456,9 +653,9 @@ func (m Message) EncodeWithLimit(limit int) ([]byte, error) {
 	return buf, nil
 }
 
-// parseMessage decodes a DNS message: its header and its question section,
-// in which domain names may be compressed. The records of the other sections
-// are not decoded.
+// parseMessage decodes a DNS message: its header, its question section and its
+// answer section. Domain names may be compressed. The records of the authority
+// and additional sections are not decoded.
 func parseMessage(data []byte) (Message, error) {
 	header, err := parseHeader(data)
 	if err != nil {
@@ -477,6 +674,17 @@ func parseMessage(data []byte) (Message, error) {
 		}
 
 		message.Questions = append(message.Questions, question)
+	}
+
+	for i := 0; i < int(header.ANCount); i++ {
+		var answer ResourceRecord
+
+		answer, offset, err = parseResourceRecord(data, offset)
+		if err != nil {
+			return Message{}, fmt.Errorf("answer %d of %d: %w", i+1, header.ANCount, err)
+		}
+
+		message.Answers = append(message.Answers, answer)
 	}
 
 	return message, nil

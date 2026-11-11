@@ -352,6 +352,113 @@ func TestAppendName(t *testing.T) {
 	}
 }
 
+func TestAppendNameEscapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		domain string
+		want   []byte
+	}{
+		{
+			name:   "escaped dot is part of the label",
+			domain: `first\.last.example.com`,
+			want:   []byte("\x0afirst.last\x07example\x03com\x00"),
+		},
+		{
+			name:   "escaped backslash",
+			domain: `a\\b.com`,
+			want:   []byte("\x03a\\b\x03com\x00"),
+		},
+		{
+			name:   "escaped ordinary character stands for itself",
+			domain: `\a\b.com`,
+			want:   []byte("\x02ab\x03com\x00"),
+		},
+		{
+			name:   "decimal escape",
+			domain: `\065\066.com`,
+			want:   []byte("\x02AB\x03com\x00"),
+		},
+		{
+			name:   "decimal escape for a dot",
+			domain: `a\046b.com`,
+			want:   []byte("\x03a.b\x03com\x00"),
+		},
+		{
+			name:   "smallest and largest decimal escapes",
+			domain: `\000\255.com`,
+			want:   []byte("\x02\x00\xff\x03com\x00"),
+		},
+		{
+			name:   "decimal escape followed by a digit",
+			domain: `\0657.com`,
+			want:   []byte("\x02A7\x03com\x00"),
+		},
+		{
+			name:   "escaped dot at the end is not a trailing dot",
+			domain: `a\.`,
+			want:   []byte("\x02a.\x00"),
+		},
+		{
+			name:   "escaped backslash followed by a trailing dot",
+			domain: `a\\.`,
+			want:   []byte("\x02a\\\x00"),
+		},
+		{
+			name:   "label that is nothing but an escaped dot",
+			domain: `\.`,
+			want:   []byte("\x01.\x00"),
+		},
+		{
+			name:   "escapes count as one byte towards the label length",
+			domain: strings.Repeat(`\.`, 63) + ".com",
+			want:   []byte("\x3f" + strings.Repeat(".", 63) + "\x03com\x00"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := appendName(nil, tt.domain)
+			if err != nil {
+				t.Fatalf("appendName(nil, %q) returned an error: %v", tt.domain, err)
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("appendName(nil, %q) = % x, want % x", tt.domain, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAppendNameRejectsInvalidEscapes(t *testing.T) {
+	tests := []struct {
+		name   string
+		domain string
+	}{
+		{name: "backslash at the end", domain: `example.com\`},
+		{name: "lone backslash", domain: `\`},
+		{name: "decimal escape of one digit", domain: `\1.com`},
+		{name: "decimal escape of two digits", domain: `\12.com`},
+		{name: "decimal escape of two digits at the end", domain: `a.\12`},
+		{name: "decimal escape with a letter in it", domain: `\1a2.com`},
+		// The characters next to the digits in ASCII: taken for digits, they
+		// would add up to a value that passes for a byte.
+		{name: "decimal escape with a slash for its second digit", domain: `\0/0.com`},
+		{name: "decimal escape with a colon for its second digit", domain: `\0:0.com`},
+		{name: "decimal escape with a slash for its third digit", domain: `\00/.com`},
+		{name: "decimal escape with a colon for its third digit", domain: `\00:.com`},
+		{name: "decimal escape just above a byte", domain: `\256.com`},
+		{name: "largest decimal escape", domain: `\999.com`},
+		{name: "label of escapes one byte over the limit", domain: strings.Repeat(`\.`, 64) + ".com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := appendName(nil, tt.domain); err == nil {
+				t.Errorf("appendName(nil, %q) = % x, want an error", tt.domain, got)
+			}
+		})
+	}
+}
+
 func TestAppendNameKeepsExistingBytes(t *testing.T) {
 	prefix := []byte{0xAA, 0xBB}
 
@@ -592,7 +699,6 @@ func TestParseNameRejectsInvalidCompressionPointers(t *testing.T) {
 		{name: "pointer cut short after labels", data: []byte("\x01a\xC0")},
 		{name: "pointer to a truncated name", data: []byte("\x05ab\xC0\x00"), offset: 3},
 		{name: "pointer to a reserved label type", data: []byte("\x80a\x00\xC0\x00"), offset: 3},
-		{name: "pointer to a label containing a dot", data: []byte("\x03a.b\x00\xC0\x00"), offset: 5},
 		{
 			// The first name is as long as a name may be, so anything in
 			// front of a pointer to it is too much.
@@ -608,6 +714,90 @@ func TestParseNameRejectsInvalidCompressionPointers(t *testing.T) {
 				t.Errorf("parseName() = %q with next offset %d, want an error", got, next)
 			}
 		})
+	}
+}
+
+func TestParseNameEscapesDotsAndBackslashesInLabels(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{name: "dot in a label", data: []byte("\x0afirst.last\x07example\x03com\x00"), want: `first\.last.example.com`},
+		{name: "backslash in a label", data: []byte("\x03a\\b\x03com\x00"), want: `a\\b.com`},
+		{name: "label that is a dot", data: []byte("\x01.\x00"), want: `\.`},
+		{name: "label that ends with a dot", data: []byte("\x02a.\x00"), want: `a\.`},
+		{name: "label that ends with a backslash", data: []byte("\x02a\\\x03com\x00"), want: `a\\.com`},
+		{name: "backslash followed by digits", data: []byte("\x04\\065\x00"), want: `\\065`},
+		{name: "dot followed by digits", data: []byte("\x04.065\x00"), want: `\.065`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseName(tt.data, 0)
+			if err != nil {
+				t.Fatalf("parseName returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseName() name = %q, want %q", got, tt.want)
+			}
+			if next != len(tt.data) {
+				t.Errorf("parseName() next offset = %d, want %d", next, len(tt.data))
+			}
+
+			// The name has to encode back to exactly the same labels.
+			encoded, err := appendName(nil, got)
+			if err != nil {
+				t.Fatalf("appendName(nil, %q) returned an error: %v", got, err)
+			}
+			if !bytes.Equal(encoded, tt.data) {
+				t.Errorf("%q encodes back to % x, want % x", got, encoded, tt.data)
+			}
+		})
+	}
+}
+
+// A label may hold any byte at all, and every one of them has to come out of
+// a trip through the text form of a name unchanged.
+func TestParseNameRoundTripsEveryByteValue(t *testing.T) {
+	for value := 0; value <= 0xFF; value++ {
+		wire := []byte{0x03, 'a', byte(value), 'b', 0x02, byte(value), byte(value), 0x01, byte(value), 0x00}
+
+		name, next, err := parseName(wire, 0)
+		if err != nil {
+			t.Fatalf("byte %#02x: parseName returned an error: %v", value, err)
+		}
+		if next != len(wire) {
+			t.Errorf("byte %#02x: next offset = %d, want %d", value, next, len(wire))
+		}
+
+		encoded, err := appendName(nil, name)
+		if err != nil {
+			t.Fatalf("byte %#02x: appendName(nil, %q) returned an error: %v", value, name, err)
+		}
+		if !bytes.Equal(encoded, wire) {
+			t.Errorf("byte %#02x: decoded as %q, which encodes back to % x, want % x", value, name, encoded, wire)
+		}
+	}
+}
+
+func TestParseNameCountsEscapedBytesOnceTowardsLengthLimit(t *testing.T) {
+	// A name of the maximum length made of nothing but dots, each of which
+	// takes two bytes in the text form of the name.
+	label := "\x3f" + strings.Repeat(".", 63)
+	wire := []byte(label + label + label + "\x3d" + strings.Repeat(".", 61) + "\x00")
+
+	name, _, err := parseName(wire, 0)
+	if err != nil {
+		t.Fatalf("parseName returned an error for a name of the maximum length: %v", err)
+	}
+
+	encoded, err := appendName(nil, name)
+	if err != nil {
+		t.Fatalf("appendName returned an error: %v", err)
+	}
+	if !bytes.Equal(encoded, wire) {
+		t.Errorf("name encodes back to % x, want % x", encoded, wire)
 	}
 }
 
@@ -662,7 +852,6 @@ func TestParseNameRejectsInvalidNames(t *testing.T) {
 			name: "largest value of label type 10 followed by as many bytes as it would count",
 			data: []byte("\xBF" + strings.Repeat("a", 191) + "\x00"),
 		},
-		{name: "label containing a dot", data: []byte("\x03a.b\x03com\x00")},
 		{
 			// 4*64 + 1 = 257 bytes encoded, two more than the limit.
 			name: "name over the length limit",
@@ -966,6 +1155,266 @@ func TestResourceRecordAppendToRejectsInvalidRecords(t *testing.T) {
 	}
 }
 
+func TestParseResourceRecord(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		offset   int
+		want     ResourceRecord
+		wantNext int
+	}{
+		{
+			name:     "A record of codecrafters.io",
+			data:     []byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08"),
+			want:     ResourceRecord{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			wantNext: 31,
+		},
+		{
+			name:     "type, class and TTL are big-endian",
+			data:     []byte("\x01a\x02io\x00\x01\x02\x03\x04\x05\x06\x07\x08\x00\x01\xFF"),
+			want:     ResourceRecord{Name: "a.io", Type: 0x0102, Class: 0x0304, TTL: 0x05060708, Data: []byte{0xFF}},
+			wantNext: 17,
+		},
+		{
+			name:     "largest TTL",
+			data:     []byte("\x01a\x02io\x00\x00\x01\x00\x01\xFF\xFF\xFF\xFF\x00\x04\x01\x02\x03\x04"),
+			want:     ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 0xFFFFFFFF, Data: []byte{1, 2, 3, 4}},
+			wantNext: 20,
+		},
+		{
+			name:     "no data",
+			data:     []byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x00"),
+			want:     ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{}},
+			wantNext: 16,
+		},
+		{
+			name:     "RDLENGTH is big-endian",
+			data:     concat([]byte("\x00\x00\x10\x00\x01\x00\x00\x00\x00\x01\x02"), bytes.Repeat([]byte{0xAB}, 0x0102)),
+			want:     ResourceRecord{Name: ".", Type: 16, Class: ClassIN, Data: bytes.Repeat([]byte{0xAB}, 0x0102)},
+			wantNext: 11 + 0x0102,
+		},
+		{
+			name:     "compressed name",
+			data:     []byte("\x01a\x02io\x00\xC0\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08"),
+			offset:   6,
+			want:     ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			wantNext: 22,
+		},
+		{
+			name:     "record in the middle of the data",
+			data:     []byte("\xAA\xBB\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08\xCC"),
+			offset:   2,
+			want:     ResourceRecord{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			wantNext: 22,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseResourceRecord(tt.data, tt.offset)
+			if err != nil {
+				t.Fatalf("parseResourceRecord returned an error: %v", err)
+			}
+			if got.Name != tt.want.Name || got.Type != tt.want.Type || got.Class != tt.want.Class || got.TTL != tt.want.TTL {
+				t.Errorf("parseResourceRecord() = %+v, want %+v", got, tt.want)
+			}
+			if !bytes.Equal(got.Data, tt.want.Data) {
+				t.Errorf("parseResourceRecord() data = % x, want % x", got.Data, tt.want.Data)
+			}
+			if next != tt.wantNext {
+				t.Errorf("parseResourceRecord() next offset = %d, want %d", next, tt.wantNext)
+			}
+		})
+	}
+}
+
+func TestParseResourceRecordCopiesData(t *testing.T) {
+	data := []byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08")
+
+	record, _, err := parseResourceRecord(data, 0)
+	if err != nil {
+		t.Fatalf("parseResourceRecord returned an error: %v", err)
+	}
+
+	// The buffer a packet was read into is reused for the next packet.
+	for i := range data {
+		data[i] = 0xEE
+	}
+
+	if want := []byte{8, 8, 8, 8}; !bytes.Equal(record.Data, want) {
+		t.Errorf("record data changed to % x along with the message it was read from", record.Data)
+	}
+}
+
+func TestParseResourceRecordRejectsInvalidRecords(t *testing.T) {
+	full := []byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08")
+
+	// Every way of cutting the record short, from nothing to one byte missing.
+	for length := 0; length < len(full); length++ {
+		if got, _, err := parseResourceRecord(full[:length], 0); err == nil {
+			t.Errorf("parseResourceRecord of the first %d bytes = %+v, want an error", length, got)
+		}
+	}
+
+	if got, _, err := parseResourceRecord([]byte("\x40a\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x00"), 0); err == nil {
+		t.Errorf("parseResourceRecord with an invalid name = %+v, want an error", got)
+	}
+}
+
+func TestParseResourceRecordExpandsCompressedNamesInData(t *testing.T) {
+	// A message body that the records below point into:
+	//
+	//	 0  www.example.com
+	//	17  mail.example.com, as mail + pointer to offset 4 (example.com)
+	const prefix = "\x03www\x07example\x03com\x00" + "\x04mail\xC0\x04"
+
+	// Everything up to the data of a record: the root as its name, then
+	// type, class, TTL and RDLENGTH.
+	record := func(recordType uint16, data string) []byte {
+		fields := []byte{0x00, byte(recordType >> 8), byte(recordType), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, byte(len(data))}
+		return concat([]byte(prefix), fields, []byte(data))
+	}
+
+	soaNumbers := "\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x05"
+
+	tests := []struct {
+		name string
+		data []byte
+		want []byte
+	}{
+		{
+			name: "CNAME that is a pointer",
+			data: record(TypeCNAME, "\xC0\x00"),
+			want: []byte("\x03www\x07example\x03com\x00"),
+		},
+		{
+			name: "CNAME that ends with a pointer",
+			data: record(TypeCNAME, "\x03web\xC0\x04"),
+			want: []byte("\x03web\x07example\x03com\x00"),
+		},
+		{
+			name: "CNAME that points to a name that ends with a pointer",
+			data: record(TypeCNAME, "\xC0\x11"),
+			want: []byte("\x04mail\x07example\x03com\x00"),
+		},
+		{
+			name: "CNAME that is not compressed",
+			data: record(TypeCNAME, "\x03web\x07example\x03org\x00"),
+			want: []byte("\x03web\x07example\x03org\x00"),
+		},
+		{
+			name: "CNAME that is the root",
+			data: record(TypeCNAME, "\x00"),
+			want: []byte("\x00"),
+		},
+		{
+			name: "NS",
+			data: record(TypeNS, "\x03ns1\xC0\x04"),
+			want: []byte("\x03ns1\x07example\x03com\x00"),
+		},
+		{
+			name: "PTR",
+			data: record(TypePTR, "\xC0\x11"),
+			want: []byte("\x04mail\x07example\x03com\x00"),
+		},
+		{
+			name: "MX keeps its preference in front of the name",
+			data: record(TypeMX, "\x00\x0A\xC0\x11"),
+			want: []byte("\x00\x0A\x04mail\x07example\x03com\x00"),
+		},
+		{
+			name: "SOA expands both names and keeps its numbers",
+			data: record(TypeSOA, "\x03ns1\xC0\x04"+"\x0afirst.last\xC0\x04"+soaNumbers),
+			want: []byte("\x03ns1\x07example\x03com\x00" + "\x0afirst.last\x07example\x03com\x00" + soaNumbers),
+		},
+		{
+			name: "MINFO expands both names",
+			data: record(14, "\xC0\x00\xC0\x11"),
+			want: []byte("\x03www\x07example\x03com\x00" + "\x04mail\x07example\x03com\x00"),
+		},
+		{
+			name: "MB, one of the obsolete types",
+			data: record(7, "\xC0\x11"),
+			want: []byte("\x04mail\x07example\x03com\x00"),
+		},
+		{
+			name: "A is kept as it is, even if it looks like a pointer",
+			data: record(TypeA, "\xC0\x00\xC0\x04"),
+			want: []byte("\xC0\x00\xC0\x04"),
+		},
+		{
+			name: "TXT is kept as it is, even if it looks like a pointer",
+			data: record(16, "\x05\xC0\x00\xC0\x04!"),
+			want: []byte("\x05\xC0\x00\xC0\x04!"),
+		},
+		{
+			name: "SRV is kept as it is: its name may not be compressed",
+			data: record(33, "\x00\x01\x00\x02\x01\xBB\x03sip\x07example\x03com\x00"),
+			want: []byte("\x00\x01\x00\x02\x01\xBB\x03sip\x07example\x03com\x00"),
+		},
+		{
+			name: "unknown type is kept as it is",
+			data: record(65280, "\xC0\x00\x01\x02"),
+			want: []byte("\xC0\x00\x01\x02"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseResourceRecord(tt.data, len(prefix))
+			if err != nil {
+				t.Fatalf("parseResourceRecord returned an error: %v", err)
+			}
+			if !bytes.Equal(got.Data, tt.want) {
+				t.Errorf("parseResourceRecord() data = % x, want % x", got.Data, tt.want)
+			}
+			if next != len(tt.data) {
+				t.Errorf("parseResourceRecord() next offset = %d, want %d", next, len(tt.data))
+			}
+		})
+	}
+}
+
+func TestParseResourceRecordRejectsInvalidDataOfTypesWithNames(t *testing.T) {
+	const prefix = "\x03www\x07example\x03com\x00"
+
+	record := func(recordType uint16, rdlength int, data string) []byte {
+		fields := []byte{0x00, byte(recordType >> 8), byte(recordType), 0x00, 0x01, 0x00, 0x00, 0x00, 0x3C, 0x00, byte(rdlength)}
+		return concat([]byte(prefix), fields, []byte(data))
+	}
+
+	soaNumbers := "\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x05"
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "CNAME without data", data: record(TypeCNAME, 0, "")},
+		{name: "CNAME cut short by RDLENGTH", data: record(TypeCNAME, 3, "\x03web\xC0\x04")},
+		{name: "CNAME that runs past RDLENGTH into what follows", data: record(TypeCNAME, 4, "\x03web\xC0\x04")},
+		{name: "CNAME with bytes after its name", data: record(TypeCNAME, 3, "\xC0\x00\x00")},
+		{name: "CNAME with two names", data: record(TypeCNAME, 4, "\xC0\x00\xC0\x04")},
+		{name: "CNAME with a pointer to itself", data: record(TypeCNAME, 2, "\xC0\x1C")},
+		{name: "CNAME with a pointer forwards", data: record(TypeCNAME, 2, "\xC0\x30")},
+		{name: "CNAME with a reserved label type", data: record(TypeCNAME, 3, "\x80a\x00")},
+		{name: "MX without a name", data: record(TypeMX, 2, "\x00\x0A")},
+		{name: "MX with half a preference", data: record(TypeMX, 1, "\x00")},
+		{name: "MX with bytes after its name", data: record(TypeMX, 5, "\x00\x0A\xC0\x00\x00")},
+		{name: "SOA with one name", data: record(TypeSOA, 2, "\xC0\x00")},
+		{name: "SOA without its numbers", data: record(TypeSOA, 4, "\xC0\x00\xC0\x04")},
+		{name: "SOA with a number missing", data: record(TypeSOA, 20, "\xC0\x00\xC0\x04"+soaNumbers[:16])},
+		{name: "SOA with a byte too many", data: record(TypeSOA, 25, "\xC0\x00\xC0\x04"+soaNumbers+"\x00")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, _, err := parseResourceRecord(tt.data, len(prefix)); err == nil {
+				t.Errorf("parseResourceRecord() = %+v, want an error", got)
+			}
+		})
+	}
+}
+
 func TestMessageEncode(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1072,6 +1521,17 @@ func TestMessageEncode(t *testing.T) {
 			name:    "ANCOUNT is zero without answers, whatever the header says",
 			message: Message{Header: Header{ID: 1, ANCount: 9}},
 			want:    []byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+		{
+			name: "NSCOUNT and ARCOUNT are zero, whatever the header says",
+			message: Message{
+				Header:    Header{ID: 1, NSCount: 3, ARCount: 4},
+				Questions: []Question{{Name: "a.io", Type: TypeA, Class: ClassIN}},
+			},
+			want: concat(
+				[]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+			),
 		},
 	}
 
@@ -1387,6 +1847,64 @@ func TestParseMessage(t *testing.T) {
 			},
 		},
 		{
+			name: "response with an answer",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01\x00\x00\x0e\x10\x00\x04\x4c\x4c\x15\x15"),
+			),
+			want: Message{
+				Header:    Header{ID: 1234, QR: true, RD: true, RA: true, QDCount: 1, ANCount: 1},
+				Questions: []Question{{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}},
+				Answers: []ResourceRecord{
+					{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 3600, Data: []byte{76, 76, 21, 21}},
+				},
+			},
+		},
+		{
+			name: "response with compressed answers",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\xC0\x0C\x00\x01\x00\x01\x00\x00\x0e\x10\x00\x04\x4c\x4c\x15\x15"),
+				[]byte("\xC0\x0C\x00\x01\x00\x01\x00\x00\x0e\x10\x00\x04\x4c\x4c\x15\x16"),
+			),
+			want: Message{
+				Header:    Header{ID: 1234, QR: true, RD: true, RA: true, QDCount: 1, ANCount: 2},
+				Questions: []Question{{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}},
+				Answers: []ResourceRecord{
+					{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 3600, Data: []byte{76, 76, 21, 21}},
+					{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 3600, Data: []byte{76, 76, 21, 22}},
+				},
+			},
+		},
+		{
+			name: "answers without a question",
+			data: concat(
+				[]byte{0x00, 0x07, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"),
+			),
+			want: Message{
+				Header:  Header{ID: 7, QR: true, ANCount: 1},
+				Answers: []ResourceRecord{{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{1, 2, 3, 4}}},
+			},
+		},
+		{
+			name: "records of the authority and additional sections are not decoded",
+			data: concat(
+				[]byte{0x00, 0x07, 0x80, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\xC0\x0C\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"),
+				[]byte("\xC0\x0E\x00\x02\x00\x01\x00\x00\x00\x3c\x00\x05\x02ns\xC0\x0E"),
+				[]byte("\x00\x00\x29\x10\x00\x00\x00\x00\x00\x00\x00"),
+			),
+			want: Message{
+				Header:    Header{ID: 7, QR: true, QDCount: 1, ANCount: 1, NSCount: 1, ARCount: 1},
+				Questions: []Question{{Name: "a.io", Type: TypeA, Class: ClassIN}},
+				Answers:   []ResourceRecord{{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{1, 2, 3, 4}}},
+			},
+		},
+		{
 			name: "bytes after the last question are ignored",
 			data: concat(
 				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
@@ -1453,6 +1971,33 @@ func TestParseMessageRejectsInvalidMessages(t *testing.T) {
 			),
 		},
 		{
+			name: "ANCOUNT promises an answer that is not there",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+			),
+		},
+		{
+			name: "ANCOUNT promises more answers than there are",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\xC0\x0C\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03\x04"),
+			),
+		},
+		{
+			name: "answer cut short",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\xC0\x0C\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x01\x02\x03"),
+			),
+		},
+		{
+			name: "largest possible ANCOUNT with no answers",
+			data: []byte{0x04, 0xD2, 0x81, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00},
+		},
+		{
 			name: "largest possible QDCOUNT with no questions",
 			data: []byte{0x04, 0xD2, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
@@ -1480,6 +2025,17 @@ func FuzzParseMessage(f *testing.F) {
 		"\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01\x03def\xC0\x10\x00\x01\x00\x01"))
 	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\xC0\x0C\x00\x01\x00\x01"))
 	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\xC0\x12\x00\x01\x00\x01\xC0\x0C\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x81\x80\x00\x01\x00\x02\x00\x00\x00\x00" +
+		"\x03www\x07example\x03com\x00\x00\x01\x00\x01" +
+		"\xC0\x0C\x00\x05\x00\x01\x00\x00\x01\x2C\x00\x06\x03web\xC0\x10" +
+		"\xC0\x2D\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x5D\xB8\xD8\x22"))
+	f.Add([]byte("\x04\xD2\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" +
+		"\x07example\x03com\x00\x00\x06\x00\x01" +
+		"\xC0\x0C\x00\x06\x00\x01\x00\x00\x0E\x10\x00\x27\x02ns\xC0\x0C\x0afirst.last\xC0\x0C" +
+		"\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x05"))
+	f.Add([]byte("\x04\xD2\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" +
+		"\x07example\x03com\x00\x00\x0F\x00\x01" +
+		"\xC0\x0C\x00\x0F\x00\x01\x00\x00\x0E\x10\x00\x09\x00\x0A\x04mail\xC0\x0C"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		message, err := parseMessage(data)
@@ -1489,6 +2045,9 @@ func FuzzParseMessage(f *testing.F) {
 
 		if len(message.Questions) != int(message.Header.QDCount) {
 			t.Fatalf("parsed %d questions, but QDCOUNT is %d", len(message.Questions), message.Header.QDCount)
+		}
+		if len(message.Answers) != int(message.Header.ANCount) {
+			t.Fatalf("parsed %d answers, but ANCOUNT is %d", len(message.Answers), message.Header.ANCount)
 		}
 
 		encoded, err := message.Encode()
@@ -1502,6 +2061,52 @@ func FuzzParseMessage(f *testing.F) {
 		}
 		if !reflect.DeepEqual(again.Questions, message.Questions) {
 			t.Fatalf("questions changed in a round trip: %+v became %+v", message.Questions, again.Questions)
+		}
+		if !reflect.DeepEqual(again.Answers, message.Answers) {
+			t.Fatalf("answers changed in a round trip: %+v became %+v", message.Answers, again.Answers)
+		}
+	})
+}
+
+// Whatever appendName accepts must decode to a name that encodes the same way.
+func FuzzAppendName(f *testing.F) {
+	f.Add("")
+	f.Add(".")
+	f.Add("codecrafters.io")
+	f.Add("codecrafters.io.")
+	f.Add(`first\.last.example.com`)
+	f.Add(`a\\b.com`)
+	f.Add(`\065\000\255.com`)
+	f.Add(`a\.`)
+	f.Add(`a\\.`)
+	f.Add(`\`)
+	f.Add("a..b")
+	f.Add(strings.Repeat("a", 63) + "." + strings.Repeat("b", 64))
+
+	f.Fuzz(func(t *testing.T, name string) {
+		encoded, err := appendName(nil, name)
+		if err != nil {
+			return
+		}
+
+		if len(encoded) > maxNameLength {
+			t.Fatalf("%q encodes to %d bytes, more than the limit of %d", name, len(encoded), maxNameLength)
+		}
+
+		decoded, next, err := parseName(encoded, 0)
+		if err != nil {
+			t.Fatalf("encoding % x of %q does not decode: %v", encoded, name, err)
+		}
+		if next != len(encoded) {
+			t.Fatalf("decoding the encoding of %q stops at offset %d of %d", name, next, len(encoded))
+		}
+
+		again, err := appendName(nil, decoded)
+		if err != nil {
+			t.Fatalf("%q decoded as %q, which does not encode: %v", name, decoded, err)
+		}
+		if !bytes.Equal(again, encoded) {
+			t.Fatalf("%q encodes to % x but decodes as %q, which encodes to % x", name, encoded, decoded, again)
 		}
 	})
 }
