@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -410,6 +411,249 @@ func TestAppendNameRejectsInvalidNames(t *testing.T) {
 	}
 }
 
+func TestParseName(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		offset   int
+		want     string
+		wantNext int
+	}{
+		{
+			name:     "two labels",
+			data:     []byte("\x06google\x03com\x00"),
+			want:     "google.com",
+			wantNext: 12,
+		},
+		{
+			name:     "codecrafters.io",
+			data:     []byte("\x0ccodecrafters\x02io\x00"),
+			want:     "codecrafters.io",
+			wantNext: 17,
+		},
+		{
+			name:     "single label",
+			data:     []byte("\x09localhost\x00"),
+			want:     "localhost",
+			wantNext: 11,
+		},
+		{
+			name:     "many labels",
+			data:     []byte("\x01a\x02bc\x03def\x07example\x03com\x00"),
+			want:     "a.bc.def.example.com",
+			wantNext: 22,
+		},
+		{
+			name:     "root",
+			data:     []byte{0x00},
+			want:     ".",
+			wantNext: 1,
+		},
+		{
+			name:     "case is preserved",
+			data:     []byte("\x0cCodeCrafters\x02IO\x00"),
+			want:     "CodeCrafters.IO",
+			wantNext: 17,
+		},
+		{
+			name:     "bytes that are not letters are preserved",
+			data:     []byte("\x04a\x00\xffb\x03c d\x00"),
+			want:     "a\x00\xffb.c d",
+			wantNext: 10,
+		},
+		{
+			name:     "name in the middle of the data",
+			data:     []byte("\xAA\xBB\x01a\x02io\x00\xCC\xDD"),
+			offset:   2,
+			want:     "a.io",
+			wantNext: 8,
+		},
+		{
+			name:     "label of the maximum length",
+			data:     []byte("\x3f" + strings.Repeat("a", 63) + "\x03com\x00"),
+			want:     strings.Repeat("a", 63) + ".com",
+			wantNext: 69,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseName(tt.data, tt.offset)
+			if err != nil {
+				t.Fatalf("parseName returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseName() name = %q, want %q", got, tt.want)
+			}
+			if next != tt.wantNext {
+				t.Errorf("parseName() next offset = %d, want %d", next, tt.wantNext)
+			}
+		})
+	}
+}
+
+func TestParseNameLongestName(t *testing.T) {
+	// Three 63-byte labels and one 61-byte label: exactly 255 bytes encoded.
+	label := strings.Repeat("a", 63)
+	want := strings.Join([]string{label, label, label, strings.Repeat("b", 61)}, ".")
+
+	data, err := appendName(nil, want)
+	if err != nil {
+		t.Fatalf("appendName returned an error: %v", err)
+	}
+
+	got, next, err := parseName(data, 0)
+	if err != nil {
+		t.Fatalf("parseName returned an error for a name of the maximum length: %v", err)
+	}
+	if got != want {
+		t.Errorf("parseName() name = %q, want %q", got, want)
+	}
+	if next != maxNameLength {
+		t.Errorf("parseName() next offset = %d, want %d", next, maxNameLength)
+	}
+}
+
+func TestParseNameRejectsInvalidNames(t *testing.T) {
+	label := "\x3f" + strings.Repeat("a", 63)
+
+	tests := []struct {
+		name   string
+		data   []byte
+		offset int
+	}{
+		{name: "no data", data: nil},
+		{name: "offset at the end of the data", data: []byte("\x01a\x00"), offset: 3},
+		{name: "offset past the end of the data", data: []byte("\x01a\x00"), offset: 9},
+		{name: "missing terminator", data: []byte("\x06google\x03com")},
+		{name: "label cut short", data: []byte("\x06goo")},
+		{name: "label length without any content", data: []byte("\x06")},
+		{name: "label type 01 is reserved", data: []byte("\x40a\x00")},
+		{name: "label type 10 is reserved", data: []byte("\x80a\x00")},
+		{name: "compression pointer", data: []byte("\x01a\x00\xC0\x00"), offset: 3},
+		{name: "label containing a dot", data: []byte("\x03a.b\x03com\x00")},
+		{
+			// 4*64 + 1 = 257 bytes encoded, two more than the limit.
+			name: "name over the length limit",
+			data: []byte(label + label + label + label + "\x00"),
+		},
+		{
+			// 3*64 + 63 + 1 = 256 bytes encoded, one more than the limit.
+			name: "name one byte over the length limit",
+			data: []byte(label + label + label + "\x3e" + strings.Repeat("b", 62) + "\x00"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, next, err := parseName(tt.data, tt.offset); err == nil {
+				t.Errorf("parseName() = %q with next offset %d, want an error", got, next)
+			}
+		})
+	}
+}
+
+// Every name that can be encoded must decode to itself.
+func TestParseNameRoundTrip(t *testing.T) {
+	names := []string{
+		".",
+		"io",
+		"codecrafters.io",
+		"abc.longassdomainname.com",
+		"CodeCrafters.IO",
+		"a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z",
+		"xn--bcher-kva.example",
+		"_dmarc.example.com",
+		strings.Repeat("a", 63) + "." + strings.Repeat("b", 63),
+	}
+
+	for _, name := range names {
+		data, err := appendName(nil, name)
+		if err != nil {
+			t.Errorf("appendName(nil, %q) returned an error: %v", name, err)
+			continue
+		}
+
+		got, next, err := parseName(data, 0)
+		if err != nil {
+			t.Errorf("parseName of the encoding of %q returned an error: %v", name, err)
+			continue
+		}
+		if got != name {
+			t.Errorf("%q decoded as %q", name, got)
+		}
+		if next != len(data) {
+			t.Errorf("%q: next offset = %d, want %d", name, next, len(data))
+		}
+	}
+}
+
+func TestParseQuestion(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     []byte
+		offset   int
+		want     Question
+		wantNext int
+	}{
+		{
+			name:     "A record of codecrafters.io",
+			data:     []byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+			want:     Question{Name: "codecrafters.io", Type: TypeA, Class: ClassIN},
+			wantNext: 21,
+		},
+		{
+			name:     "type and class are big-endian",
+			data:     []byte("\x01a\x02io\x00\x01\x02\x03\x04"),
+			want:     Question{Name: "a.io", Type: 0x0102, Class: 0x0304},
+			wantNext: 10,
+		},
+		{
+			name:     "root name",
+			data:     []byte{0x00, 0x00, 0x02, 0x00, 0x01},
+			want:     Question{Name: ".", Type: 2, Class: ClassIN},
+			wantNext: 5,
+		},
+		{
+			name:     "question in the middle of the data",
+			data:     []byte("\xAA\xBB\xCC\x01a\x02io\x00\x00\x01\x00\x01\xDD"),
+			offset:   3,
+			want:     Question{Name: "a.io", Type: TypeA, Class: ClassIN},
+			wantNext: 13,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseQuestion(tt.data, tt.offset)
+			if err != nil {
+				t.Fatalf("parseQuestion returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseQuestion() = %+v, want %+v", got, tt.want)
+			}
+			if next != tt.wantNext {
+				t.Errorf("parseQuestion() next offset = %d, want %d", next, tt.wantNext)
+			}
+		})
+	}
+}
+
+func TestParseQuestionRejectsInvalidQuestions(t *testing.T) {
+	full := []byte("\x01a\x02io\x00\x00\x01\x00\x01")
+
+	// Every way of cutting the question short, from nothing to one byte missing.
+	for length := 0; length < len(full); length++ {
+		if got, _, err := parseQuestion(full[:length], 0); err == nil {
+			t.Errorf("parseQuestion of the first %d bytes = %+v, want an error", length, got)
+		}
+	}
+
+	if got, _, err := parseQuestion([]byte("\x40a\x00\x00\x01\x00\x01"), 0); err == nil {
+		t.Errorf("parseQuestion with an invalid name = %+v, want an error", got)
+	}
+}
+
 func TestQuestionAppendTo(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -769,6 +1013,265 @@ func TestMessageEncodeRejectsTooManyAnswers(t *testing.T) {
 	if _, err := message.Encode(); err == nil {
 		t.Error("Encode() accepted 65536 answers, which ANCOUNT cannot count")
 	}
+}
+
+func TestMessageEncodeWithLimit(t *testing.T) {
+	// The header takes 12 bytes, each question 10 and each answer 20.
+	message := Message{
+		Header: Header{ID: 0x0102, QR: true, RD: true},
+		Questions: []Question{
+			{Name: "a.io", Type: TypeA, Class: ClassIN},
+			{Name: "b.io", Type: TypeA, Class: ClassIN},
+		},
+		Answers: []ResourceRecord{
+			{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1, Data: []byte{1, 1, 1, 1}},
+			{Name: "b.io", Type: TypeA, Class: ClassIN, TTL: 2, Data: []byte{2, 2, 2, 2}},
+		},
+	}
+
+	questionA := []byte("\x01a\x02io\x00\x00\x01\x00\x01")
+	questionB := []byte("\x01b\x02io\x00\x00\x01\x00\x01")
+	answerA := []byte("\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04\x01\x01\x01\x01")
+	answerB := []byte("\x01b\x02io\x00\x00\x01\x00\x01\x00\x00\x00\x02\x00\x04\x02\x02\x02\x02")
+
+	tests := []struct {
+		name  string
+		limit int
+		want  []byte
+	}{
+		{
+			name:  "everything fits exactly",
+			limit: 72,
+			want: concat(
+				[]byte{0x01, 0x02, 0x81, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB, answerA, answerB,
+			),
+		},
+		{
+			name:  "everything fits with room to spare",
+			limit: 512,
+			want: concat(
+				[]byte{0x01, 0x02, 0x81, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB, answerA, answerB,
+			),
+		},
+		{
+			name:  "one byte short drops the last answer and sets TC",
+			limit: 71,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB, answerA,
+			),
+		},
+		{
+			name:  "room for exactly one answer",
+			limit: 52,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB, answerA,
+			),
+		},
+		{
+			name:  "no room for any answer",
+			limit: 51,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB,
+			),
+		},
+		{
+			name:  "a question that does not fit is dropped along with every answer",
+			limit: 31,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				questionA,
+			),
+		},
+		{
+			name:  "room for the header alone",
+			limit: 12,
+			want:  []byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := message.EncodeWithLimit(tt.limit)
+			if err != nil {
+				t.Fatalf("EncodeWithLimit(%d) returned an error: %v", tt.limit, err)
+			}
+			if len(got) > tt.limit {
+				t.Errorf("EncodeWithLimit(%d) returned %d bytes", tt.limit, len(got))
+			}
+			if !bytes.Equal(got, tt.want) {
+				t.Errorf("EncodeWithLimit(%d) = % x, want % x", tt.limit, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMessageEncodeWithLimitKeepsTruncationFlag(t *testing.T) {
+	message := Message{Header: Header{ID: 1, TC: true}}
+
+	got, err := message.EncodeWithLimit(512)
+	if err != nil {
+		t.Fatalf("EncodeWithLimit returned an error: %v", err)
+	}
+
+	want := []byte{0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("EncodeWithLimit(512) = % x, want % x", got, want)
+	}
+}
+
+func TestMessageEncodeWithLimitRejectsLimitBelowHeaderSize(t *testing.T) {
+	for _, limit := range []int{-1, 0, 11} {
+		if got, err := (Message{}).EncodeWithLimit(limit); err == nil {
+			t.Errorf("EncodeWithLimit(%d) = % x, want an error", limit, got)
+		}
+	}
+}
+
+func TestParseMessage(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want Message
+	}{
+		{
+			name: "header only",
+			data: []byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Message{Header: Header{ID: 1234, RD: true}},
+		},
+		{
+			name: "query with one question",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+			),
+			want: Message{
+				Header:    Header{ID: 1234, RD: true, QDCount: 1},
+				Questions: []Question{{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}},
+			},
+		},
+		{
+			name: "query with several questions",
+			data: concat(
+				[]byte{0xBE, 0xEF, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\x01b\x02io\x00\x00\x05\x00\x01"),
+				[]byte("\x00\x00\x02\x00\x01"),
+			),
+			want: Message{
+				Header: Header{ID: 0xBEEF, QDCount: 3},
+				Questions: []Question{
+					{Name: "a.io", Type: TypeA, Class: ClassIN},
+					{Name: "b.io", Type: 5, Class: ClassIN},
+					{Name: ".", Type: 2, Class: ClassIN},
+				},
+			},
+		},
+		{
+			name: "bytes after the last question are ignored",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte{0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // EDNS OPT record
+			),
+			want: Message{
+				Header:    Header{ID: 1234, RD: true, QDCount: 1, ARCount: 1},
+				Questions: []Question{{Name: "a.io", Type: TypeA, Class: ClassIN}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseMessage(tt.data)
+			if err != nil {
+				t.Fatalf("parseMessage returned an error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseMessage() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseMessageRejectsInvalidMessages(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "no data", data: nil},
+		{name: "one byte short of a header", data: make([]byte, headerSize-1)},
+		{
+			name: "QDCOUNT promises a question that is not there",
+			data: []byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+		{
+			name: "QDCOUNT promises more questions than there are",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+			),
+		},
+		{
+			name: "question cut short",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00"),
+			),
+		},
+		{
+			name: "largest possible QDCOUNT with no questions",
+			data: []byte{0x04, 0xD2, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, err := parseMessage(tt.data); err == nil {
+				t.Errorf("parseMessage() = %+v, want an error", got)
+			}
+		})
+	}
+}
+
+// Whatever parseMessage accepts must survive a trip through the encoder and
+// back, and no input may make it panic.
+func FuzzParseMessage(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x02\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\xC0\x0C\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\xFF\xFF\x00\x00\x00\x00\x00\x00\x3f"))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		message, err := parseMessage(data)
+		if err != nil {
+			return
+		}
+
+		if len(message.Questions) != int(message.Header.QDCount) {
+			t.Fatalf("parsed %d questions, but QDCOUNT is %d", len(message.Questions), message.Header.QDCount)
+		}
+
+		encoded, err := message.Encode()
+		if err != nil {
+			t.Fatalf("parsed message %+v does not encode: %v", message, err)
+		}
+
+		again, err := parseMessage(encoded)
+		if err != nil {
+			t.Fatalf("encoding % x of parsed message %+v does not parse: %v", encoded, message, err)
+		}
+		if !reflect.DeepEqual(again.Questions, message.Questions) {
+			t.Fatalf("questions changed in a round trip: %+v became %+v", message.Questions, again.Questions)
+		}
+	})
 }
 
 // concat joins byte slices into a new slice.

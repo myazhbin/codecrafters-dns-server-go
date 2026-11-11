@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -10,6 +12,10 @@ import (
 // headerSize is the length in bytes of the header section, which is the same
 // for every DNS message.
 const headerSize = 12
+
+// maxUDPSize is the size in bytes of the largest DNS message that may be sent
+// over UDP (RFC 1035, section 4.2.1).
+const maxUDPSize = 512
 
 // Positions of the fields packed into the 16-bit flags word that follows the
 // ID in the header:
@@ -51,6 +57,7 @@ const (
 // Response codes (RFC 1035, section 4.1.1).
 const (
 	RCodeNoError        uint8 = 0 // No error condition.
+	RCodeFormatError    uint8 = 1 // The server was unable to interpret the query.
 	RCodeNotImplemented uint8 = 4 // The server does not support this kind of query.
 )
 
@@ -170,6 +177,28 @@ func (q Question) appendTo(buf []byte) ([]byte, error) {
 	return buf, nil
 }
 
+// parseQuestion decodes the question that starts at offset in the DNS message
+// data. It returns the question and the offset of the byte that follows it.
+func parseQuestion(data []byte, offset int) (Question, int, error) {
+	name, offset, err := parseName(data, offset)
+	if err != nil {
+		return Question{}, 0, err
+	}
+
+	// The name is followed by the type and the class, two bytes each.
+	if len(data)-offset < 4 {
+		return Question{}, 0, errors.New("message ends before the type and class of the question")
+	}
+
+	question := Question{
+		Name:  name,
+		Type:  binary.BigEndian.Uint16(data[offset:]),
+		Class: binary.BigEndian.Uint16(data[offset+2:]),
+	}
+
+	return question, offset + 4, nil
+}
+
 // ResourceRecord is an entry in the answer section of a DNS message (RFC 1035,
 // section 4.1.3).
 type ResourceRecord struct {
@@ -238,6 +267,64 @@ func appendName(buf []byte, name string) ([]byte, error) {
 	return buf, nil
 }
 
+// parseName decodes the domain name that starts at offset in the DNS message
+// data. It returns the name and the offset of the byte that follows it.
+//
+// The labels of the name are joined with dots, without a trailing dot:
+// \x06google\x03com\x00 becomes "google.com". The root, which has no labels, is
+// returned as ".".
+func parseName(data []byte, offset int) (string, int, error) {
+	var name []byte
+
+	for {
+		if offset >= len(data) {
+			return "", 0, errors.New("message ends in the middle of a domain name")
+		}
+
+		length := int(data[offset])
+		offset++
+
+		if length == 0 {
+			break
+		}
+
+		// A length byte with either of its top two bits set is not a plain
+		// length. Compressed names, which use both bits, are not supported.
+		if length > maxLabelLength {
+			return "", 0, fmt.Errorf("domain name has an unsupported label type %#02x", length)
+		}
+		if length > len(data)-offset {
+			return "", 0, errors.New("message ends in the middle of a domain name label")
+		}
+
+		label := data[offset : offset+length]
+		offset += length
+
+		// A dot inside a label could not be told apart from the dots that
+		// separate labels once the name is written as text.
+		if bytes.IndexByte(label, '.') >= 0 {
+			return "", 0, fmt.Errorf("domain name has a label that contains a dot: %q", label)
+		}
+
+		if len(name) > 0 {
+			name = append(name, '.')
+		}
+		name = append(name, label...)
+
+		// The text form is two bytes shorter than the wire format, which has
+		// a length byte per label instead of the dots and a terminating zero.
+		if len(name)+2 > maxNameLength {
+			return "", 0, fmt.Errorf("domain name takes more than %d bytes to encode", maxNameLength)
+		}
+	}
+
+	if len(name) == 0 {
+		return ".", offset, nil
+	}
+
+	return string(name), offset, nil
+}
+
 // Message is a DNS message. Of its five sections (header, question, answer,
 // authority and additional) the authority and additional sections are not
 // supported yet.
@@ -247,12 +334,26 @@ type Message struct {
 	Answers   []ResourceRecord
 }
 
-// Encode returns the wire format of the message.
+// Encode returns the wire format of the message, however long that is.
 //
 // QDCOUNT and ANCOUNT are taken from the number of questions and answers in
 // the message rather than from Header.QDCount and Header.ANCount, so the header
 // cannot disagree with the sections that follow it.
 func (m Message) Encode() ([]byte, error) {
+	return m.EncodeWithLimit(math.MaxInt)
+}
+
+// EncodeWithLimit returns the wire format of as much of the message as fits
+// in limit bytes, for transports that restrict the size of a message.
+//
+// Questions and then answers are encoded in order until one does not fit.
+// That entry and all those after it are left out, and the TC flag is set to
+// tell the receiver that the message is incomplete. QDCOUNT and ANCOUNT count
+// the entries that were encoded.
+func (m Message) EncodeWithLimit(limit int) ([]byte, error) {
+	if limit < headerSize {
+		return nil, fmt.Errorf("limit of %d bytes leaves no room for the %d-byte header", limit, headerSize)
+	}
 	if len(m.Questions) > math.MaxUint16 {
 		return nil, fmt.Errorf("message has %d questions, the limit is %d", len(m.Questions), math.MaxUint16)
 	}
@@ -260,25 +361,72 @@ func (m Message) Encode() ([]byte, error) {
 		return nil, fmt.Errorf("message has %d answers, the limit is %d", len(m.Answers), math.MaxUint16)
 	}
 
-	header := m.Header
-	header.QDCount = uint16(len(m.Questions))
-	header.ANCount = uint16(len(m.Answers))
+	// The header comes first on the wire but is written last, once it is
+	// known how many entries fit.
+	buf := make([]byte, headerSize, maxUDPSize)
 
-	buf := header.appendTo(make([]byte, 0, 512))
-
-	var err error
+	questions, answers := 0, 0
+	complete := true
 
 	for _, question := range m.Questions {
-		if buf, err = question.appendTo(buf); err != nil {
+		extended, err := question.appendTo(buf)
+		if err != nil {
 			return nil, err
 		}
+		if len(extended) > limit {
+			complete = false
+			break
+		}
+
+		buf = extended
+		questions++
 	}
 
-	for _, answer := range m.Answers {
-		if buf, err = answer.appendTo(buf); err != nil {
+	for i := 0; complete && i < len(m.Answers); i++ {
+		extended, err := m.Answers[i].appendTo(buf)
+		if err != nil {
 			return nil, err
 		}
+		if len(extended) > limit {
+			complete = false
+			break
+		}
+
+		buf = extended
+		answers++
 	}
+
+	header := m.Header
+	header.QDCount = uint16(questions)
+	header.ANCount = uint16(answers)
+	header.TC = header.TC || !complete
+
+	copy(buf, header.appendTo(nil))
 
 	return buf, nil
+}
+
+// parseMessage decodes a DNS message: its header and its question section.
+// The records of the other sections are not decoded.
+func parseMessage(data []byte) (Message, error) {
+	header, err := parseHeader(data)
+	if err != nil {
+		return Message{}, err
+	}
+
+	message := Message{Header: header}
+	offset := headerSize
+
+	for i := 0; i < int(header.QDCount); i++ {
+		var question Question
+
+		question, offset, err = parseQuestion(data, offset)
+		if err != nil {
+			return Message{}, fmt.Errorf("question %d of %d: %w", i+1, header.QDCount, err)
+		}
+
+		message.Questions = append(message.Questions, question)
+	}
+
+	return message, nil
 }

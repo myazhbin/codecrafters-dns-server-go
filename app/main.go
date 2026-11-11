@@ -59,46 +59,67 @@ func serve(udpConn *net.UDPConn) {
 // itself a response, since answering responses lets two servers bounce packets
 // off each other forever.
 func respond(packet []byte) ([]byte, error) {
-	query, err := parseHeader(packet)
+	header, err := parseHeader(packet)
 	if err != nil {
 		return nil, err
 	}
-	if query.QR {
+	if header.QR {
 		return nil, errors.New("packet is a response, not a query")
 	}
 
-	return buildResponse(query).Encode()
+	// A reply must fit in a single UDP packet. One that does not is cut short
+	// and flagged as truncated.
+	return buildResponse(header, packet).EncodeWithLimit(maxUDPSize)
 }
 
-// buildResponse returns the reply to a query with the given header. The ID,
-// OPCODE and RD flag of the query are copied into the reply.
+// buildResponse returns the reply to the query in packet, whose header has
+// already been decoded. The ID, OPCODE and RD flag of the query are copied
+// into the reply.
 //
-// Only standard queries are supported, and what they ask is not inspected yet:
-// each one is answered with a question about the A record of codecrafters.io
-// and that record. Any other kind of query gets a "not implemented" reply that
-// consists of a header alone.
-func buildResponse(query Header) Message {
+// Only standard queries are supported: any other kind gets a "not implemented"
+// reply that consists of a header alone, and so does a standard query that
+// cannot be decoded, with a "format error". Otherwise the reply repeats the
+// questions of the query and answers them.
+func buildResponse(header Header, packet []byte) Message {
 	response := Message{
 		Header: Header{
-			ID:     query.ID,
+			ID:     header.ID,
 			QR:     true,
-			Opcode: query.Opcode,
-			RD:     query.RD,
+			Opcode: header.Opcode,
+			RD:     header.RD,
 			RCode:  RCodeNoError,
 		},
 	}
 
-	if query.Opcode != OpcodeQuery {
+	if header.Opcode != OpcodeQuery {
 		response.Header.RCode = RCodeNotImplemented
 		return response
 	}
 
-	response.Questions = []Question{
-		{Name: "codecrafters.io", Type: TypeA, Class: ClassIN},
+	query, err := parseMessage(packet)
+	if err != nil {
+		fmt.Println("Failed to parse query:", err)
+		response.Header.RCode = RCodeFormatError
+		return response
 	}
-	response.Answers = []ResourceRecord{
-		{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+
+	response.Questions = query.Questions
+	for _, question := range query.Questions {
+		response.Answers = append(response.Answers, resolve(question)...)
 	}
 
 	return response
+}
+
+// resolve returns the records that answer a question. There is no real data
+// behind this server: every domain name has the same A record and no records
+// of any other type or class.
+func resolve(question Question) []ResourceRecord {
+	if question.Type != TypeA || question.Class != ClassIN {
+		return nil
+	}
+
+	return []ResourceRecord{
+		{Name: question.Name, Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+	}
 }

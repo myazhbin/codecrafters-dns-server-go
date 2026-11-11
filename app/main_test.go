@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"net"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -77,6 +80,18 @@ func mustEncode(t *testing.T, message Message) []byte {
 	}
 
 	return packet
+}
+
+// mustParse returns the DNS message in packet.
+func mustParse(t *testing.T, packet []byte) Message {
+	t.Helper()
+
+	message, err := parseMessage(packet)
+	if err != nil {
+		t.Fatalf("failed to parse % x: %v", packet, err)
+	}
+
+	return message
 }
 
 // mustParseHeader returns the header of the DNS message in packet.
@@ -367,19 +382,332 @@ func TestRespondToUnsupportedOpcodeIsHeaderOnly(t *testing.T) {
 	}
 }
 
-func TestRespondToHeaderWithoutQuestion(t *testing.T) {
-	// A header on its own is enough to reply to: nothing after it is read yet.
+func TestRespondToQueryWithoutQuestions(t *testing.T) {
 	response, err := respond(Header{ID: 42, RD: true}.appendTo(nil))
 	if err != nil {
 		t.Fatalf("respond returned an error: %v", err)
 	}
 
-	got := mustParseHeader(t, response)
-	want := Header{ID: 42, QR: true, RD: true, QDCount: 1, ANCount: 1}
+	// Nothing was asked, so there is nothing to repeat and nothing to answer.
+	want := mustEncode(t, Message{Header: Header{ID: 42, QR: true, RD: true}})
 
-	if got != want {
-		t.Errorf("response header = %+v, want %+v", got, want)
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
 	}
+}
+
+func TestRespondMimicsQuestionAndAnswersIt(t *testing.T) {
+	names := []string{
+		"codecrafters.io",
+		"google.com",
+		"abc.longassdomainname.com",
+		"CodeCrafters.IO",
+		"localhost",
+		"a.b.c.d.e.f.example.org",
+		".",
+	}
+
+	// The tester asks about random domains, so do the same.
+	random := rand.New(rand.NewSource(1))
+	for i := 0; i < 20; i++ {
+		names = append(names, randomDomain(random))
+	}
+
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			query := mustEncode(t, Message{
+				Header:    Header{ID: 0x1A2B, RD: true},
+				Questions: []Question{{Name: name, Type: TypeA, Class: ClassIN}},
+			})
+
+			response, err := respond(query)
+			if err != nil {
+				t.Fatalf("respond returned an error: %v", err)
+			}
+
+			want := mustEncode(t, Message{
+				Header:    Header{ID: 0x1A2B, QR: true, RD: true},
+				Questions: []Question{{Name: name, Type: TypeA, Class: ClassIN}},
+				Answers:   []ResourceRecord{{Name: name, Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}}},
+			})
+
+			if !bytes.Equal(response, want) {
+				t.Errorf("response = % x, want % x", response, want)
+			}
+		})
+	}
+}
+
+// randomDomain returns a domain name made of two to four random labels.
+func randomDomain(random *rand.Rand) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789-"
+
+	labels := make([]string, 2+random.Intn(3))
+	for i := range labels {
+		label := make([]byte, 1+random.Intn(20))
+		for j := range label {
+			label[j] = letters[random.Intn(len(letters))]
+		}
+		labels[i] = string(label)
+	}
+
+	return strings.Join(labels, ".")
+}
+
+func TestRespondAnswersEveryQuestion(t *testing.T) {
+	query := mustEncode(t, Message{
+		Header: Header{ID: 7},
+		Questions: []Question{
+			{Name: "abc.example.com", Type: TypeA, Class: ClassIN},
+			{Name: "def.example.com", Type: TypeA, Class: ClassIN},
+			{Name: "example.org", Type: TypeA, Class: ClassIN},
+		},
+	})
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	want := mustEncode(t, Message{
+		Header: Header{ID: 7, QR: true},
+		Questions: []Question{
+			{Name: "abc.example.com", Type: TypeA, Class: ClassIN},
+			{Name: "def.example.com", Type: TypeA, Class: ClassIN},
+			{Name: "example.org", Type: TypeA, Class: ClassIN},
+		},
+		Answers: []ResourceRecord{
+			{Name: "abc.example.com", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			{Name: "def.example.com", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+			{Name: "example.org", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+		},
+	})
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondOnlyAnswersQuestionsAboutARecords(t *testing.T) {
+	const (
+		typeAAAA  = 28
+		classCHAO = 3
+	)
+
+	questions := []Question{
+		{Name: "a.example.com", Type: typeAAAA, Class: ClassIN},
+		{Name: "b.example.com", Type: TypeA, Class: ClassIN},
+		{Name: "c.example.com", Type: TypeA, Class: classCHAO},
+	}
+
+	response, err := respond(mustEncode(t, Message{Header: Header{ID: 7}, Questions: questions}))
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	// Every question is repeated as it was asked, but the server only has A
+	// records in the IN class to answer with.
+	want := mustEncode(t, Message{
+		Header:    Header{ID: 7, QR: true},
+		Questions: questions,
+		Answers: []ResourceRecord{
+			{Name: "b.example.com", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+		},
+	})
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondIgnoresWhatFollowsTheQuestions(t *testing.T) {
+	// dig appends an EDNS OPT record to its queries unless told not to.
+	query := concat(
+		[]byte{0x04, 0xD2, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+		[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+		[]byte{0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+	)
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	want := mustEncode(t, Message{
+		Header:    Header{ID: 1234, QR: true, RD: true},
+		Questions: []Question{{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}},
+		Answers: []ResourceRecord{
+			{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}},
+		},
+	})
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondWithFormatErrorToMalformedQuery(t *testing.T) {
+	header := []byte{0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	tests := []struct {
+		name  string
+		query []byte
+	}{
+		{name: "QDCOUNT promises a question that is not there", query: header},
+		{name: "name cut short", query: concat(header, []byte("\x0ccodecraf"))},
+		{name: "name without terminator", query: concat(header, []byte("\x0ccodecrafters\x02io"))},
+		{name: "type and class cut short", query: concat(header, []byte("\x0ccodecrafters\x02io\x00\x00\x01\x00"))},
+		{name: "reserved label type", query: concat(header, []byte("\x80codecrafters\x02io\x00\x00\x01\x00\x01"))},
+	}
+
+	// The header could be read, so the reply still mimics it. Nothing else is known.
+	want := mustEncode(t, Message{
+		Header: Header{ID: 0xABCD, QR: true, RD: true, RCode: RCodeFormatError},
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := respond(tt.query)
+			if err != nil {
+				t.Fatalf("respond returned an error: %v", err)
+			}
+			if !bytes.Equal(response, want) {
+				t.Errorf("response = % x, want % x", response, want)
+			}
+		})
+	}
+}
+
+func TestRespondDoesNotParseQueriesWithUnsupportedOpcode(t *testing.T) {
+	// What follows the header of such a query may not even be a question
+	// section, so "not implemented" wins over "format error".
+	query := concat(
+		[]byte{0xAB, 0xCD, 0x28, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		[]byte("\x0ccodecraf"),
+	)
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	want := mustEncode(t, Message{
+		Header: Header{ID: 0xABCD, QR: true, Opcode: 5, RCode: RCodeNotImplemented},
+	})
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondTruncatesReplyThatDoesNotFitInUDPPacket(t *testing.T) {
+	// 20 questions about a 27-byte name take 12 + 20*31 = 632 bytes on their
+	// own, before a single answer is added.
+	questions := make([]Question, 20)
+	for i := range questions {
+		questions[i] = Question{Name: fmt.Sprintf("host-%02d.subdomain.example", i), Type: TypeA, Class: ClassIN}
+	}
+
+	query := mustEncode(t, Message{Header: Header{ID: 99, RD: true}, Questions: questions})
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	if len(response) > maxUDPSize {
+		t.Fatalf("response is %d bytes, more than the %d that fit in a UDP packet", len(response), maxUDPSize)
+	}
+
+	got := mustParse(t, response)
+
+	// (512 - 12) / 31 = 16 questions fit, and then no answers.
+	want := Message{
+		Header:    Header{ID: 99, QR: true, TC: true, RD: true, QDCount: 16},
+		Questions: questions[:16],
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("response = %+v, want %+v", got, want)
+	}
+	if wantSize := headerSize + 16*31; len(response) != wantSize {
+		t.Errorf("response is %d bytes, want %d: something follows the questions", len(response), wantSize)
+	}
+}
+
+func TestRespondDoesNotTruncateReplyThatFits(t *testing.T) {
+	// 8 questions about a 24-byte name: 12 + 8*30 + 8*40 = 572 bytes would
+	// not fit, but 7 of them take 12 + 7*30 + 7*40 = 502 bytes and do.
+	questions := make([]Question, 7)
+	for i := range questions {
+		questions[i] = Question{Name: fmt.Sprintf("host-%d.subdomain.example", i), Type: TypeA, Class: ClassIN}
+	}
+
+	response, err := respond(mustEncode(t, Message{Header: Header{ID: 99}, Questions: questions}))
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	header := mustParseHeader(t, response)
+	want := Header{ID: 99, QR: true, QDCount: 7, ANCount: 7}
+
+	if header != want {
+		t.Errorf("response header = %+v, want %+v", header, want)
+	}
+	if len(response) != 502 {
+		t.Errorf("response is %d bytes, want 502", len(response))
+	}
+}
+
+// A reply, if there is one, must be a well-formed DNS message that fits in a
+// UDP packet and carries the ID of the query, whatever the query looks like.
+func FuzzRespond(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x09\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x81\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x1c\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\xC0\x0C\x00\x01\x00\x01"))
+	f.Add(append([]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		bytes.Repeat([]byte{0x00, 0x00, 0x01, 0x00, 0x01}, 100)...))
+
+	f.Fuzz(func(t *testing.T, packet []byte) {
+		response, err := respond(packet)
+		if err != nil {
+			if response != nil {
+				t.Fatalf("respond returned both a reply and an error: %v", err)
+			}
+			return
+		}
+
+		if len(response) > maxUDPSize {
+			t.Fatalf("reply is %d bytes, more than the %d that fit in a UDP packet", len(response), maxUDPSize)
+		}
+
+		query, err := parseHeader(packet)
+		if err != nil {
+			t.Fatalf("respond replied to a packet without a header: % x", packet)
+		}
+
+		reply, err := parseMessage(response)
+		if err != nil {
+			t.Fatalf("reply % x does not parse: %v", response, err)
+		}
+
+		if !reply.Header.QR {
+			t.Fatal("reply does not have the QR flag set")
+		}
+		if reply.Header.ID != query.ID {
+			t.Fatalf("reply has ID %d, query has ID %d", reply.Header.ID, query.ID)
+		}
+		if reply.Header.Opcode != query.Opcode {
+			t.Fatalf("reply has OPCODE %d, query has OPCODE %d", reply.Header.Opcode, query.Opcode)
+		}
+		if reply.Header.RD != query.RD {
+			t.Fatalf("reply has RD %t, query has RD %t", reply.Header.RD, query.RD)
+		}
+	})
 }
 
 func TestRespondRejectsPacketsItCannotAnswer(t *testing.T) {
