@@ -41,12 +41,23 @@ const (
 // Limits on the wire format of a domain name (RFC 1035, section 2.3.4).
 const (
 	// maxLabelLength is the longest a single label may be. A label's length
-	// byte has only six usable bits: the top two are reserved.
+	// byte has only six usable bits: the top two say what kind of label it is.
 	maxLabelLength = 63
 
-	// maxNameLength is the longest an encoded name may be, counting every
-	// length byte and the terminating zero byte.
+	// maxNameLength is the longest a name may be once encoded without
+	// compression, counting every length byte and the terminating zero byte.
 	maxNameLength = 255
+)
+
+// Message compression (RFC 1035, section 4.1.4). A name, or the tail end of
+// one, can be replaced with a two-byte pointer to an earlier occurrence of the
+// same labels. A pointer has the top two bits of its first byte set, which
+// tells it apart from a label, and holds an offset from the start of the
+// message in its other 14 bits.
+const (
+	labelTypeMask    = 0xC0
+	labelTypePointer = 0xC0
+	pointerMask      = 0x3FFF
 )
 
 // Operation codes, the kind of query a message carries (RFC 1035, section 4.1.1).
@@ -268,7 +279,8 @@ func appendName(buf []byte, name string) ([]byte, error) {
 }
 
 // parseName decodes the domain name that starts at offset in the DNS message
-// data. It returns the name and the offset of the byte that follows it.
+// data, following compression pointers to the rest of the name where there are
+// any. It returns the name and the offset of the byte that follows it.
 //
 // The labels of the name are joined with dots, without a trailing dot:
 // \x06google\x03com\x00 becomes "google.com". The root, which has no labels, is
@@ -276,20 +288,52 @@ func appendName(buf []byte, name string) ([]byte, error) {
 func parseName(data []byte, offset int) (string, int, error) {
 	var name []byte
 
+	// start is where the run of labels being read begins.
+	start := offset
+
+	// next is the offset of the byte that follows the name. A name ends at its
+	// first pointer: what the pointer leads to belongs to an earlier name.
+	next := -1
+
 	for {
 		if offset >= len(data) {
 			return "", 0, errors.New("message ends in the middle of a domain name")
 		}
 
 		length := int(data[offset])
+
+		if length&labelTypeMask == labelTypePointer {
+			if offset+1 >= len(data) {
+				return "", 0, errors.New("message ends in the middle of a compression pointer")
+			}
+
+			target := int(binary.BigEndian.Uint16(data[offset:]) & pointerMask)
+
+			// A pointer refers to an earlier occurrence of a name, so it has
+			// to lead backwards. Holding every pointer to that also keeps a
+			// malicious message from sending the parser around in circles:
+			// each jump lands before the run of labels that led to it, so a
+			// name can only jump so many times before it runs out of message.
+			if target >= start {
+				return "", 0, fmt.Errorf("compression pointer at offset %d leads to offset %d, "+
+					"which is not before the labels it follows", offset, target)
+			}
+
+			if next < 0 {
+				next = offset + 2
+			}
+
+			offset, start = target, target
+			continue
+		}
+
 		offset++
 
 		if length == 0 {
 			break
 		}
 
-		// A length byte with either of its top two bits set is not a plain
-		// length. Compressed names, which use both bits, are not supported.
+		// Only one of the top two bits is set, which no label type uses.
 		if length > maxLabelLength {
 			return "", 0, fmt.Errorf("domain name has an unsupported label type %#02x", length)
 		}
@@ -311,18 +355,23 @@ func parseName(data []byte, offset int) (string, int, error) {
 		}
 		name = append(name, label...)
 
-		// The text form is two bytes shorter than the wire format, which has
-		// a length byte per label instead of the dots and a terminating zero.
+		// The text form is two bytes shorter than the uncompressed wire
+		// format, which has a length byte per label instead of the dots and
+		// a terminating zero.
 		if len(name)+2 > maxNameLength {
 			return "", 0, fmt.Errorf("domain name takes more than %d bytes to encode", maxNameLength)
 		}
 	}
 
-	if len(name) == 0 {
-		return ".", offset, nil
+	if next < 0 {
+		next = offset
 	}
 
-	return string(name), offset, nil
+	if len(name) == 0 {
+		return ".", next, nil
+	}
+
+	return string(name), next, nil
 }
 
 // Message is a DNS message. Of its five sections (header, question, answer,
@@ -334,7 +383,8 @@ type Message struct {
 	Answers   []ResourceRecord
 }
 
-// Encode returns the wire format of the message, however long that is.
+// Encode returns the wire format of the message, however long that is. Domain
+// names are written out in full, without compression.
 //
 // QDCOUNT and ANCOUNT are taken from the number of questions and answers in
 // the message rather than from Header.QDCount and Header.ANCount, so the header
@@ -406,8 +456,9 @@ func (m Message) EncodeWithLimit(limit int) ([]byte, error) {
 	return buf, nil
 }
 
-// parseMessage decodes a DNS message: its header and its question section.
-// The records of the other sections are not decoded.
+// parseMessage decodes a DNS message: its header and its question section,
+// in which domain names may be compressed. The records of the other sections
+// are not decoded.
 func parseMessage(data []byte) (Message, error) {
 	header, err := parseHeader(data)
 	if err != nil {

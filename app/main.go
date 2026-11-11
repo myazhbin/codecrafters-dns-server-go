@@ -79,7 +79,8 @@ func respond(packet []byte) ([]byte, error) {
 // Only standard queries are supported: any other kind gets a "not implemented"
 // reply that consists of a header alone, and so does a standard query that
 // cannot be decoded, with a "format error". Otherwise the reply repeats the
-// questions of the query and answers them.
+// questions of the query and answers them. Domain names that were compressed
+// in the query are written out in full in the reply.
 func buildResponse(header Header, packet []byte) Message {
 	response := Message{
 		Header: Header{

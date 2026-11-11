@@ -488,6 +488,133 @@ func TestRespondAnswersEveryQuestion(t *testing.T) {
 	}
 }
 
+func TestRespondToCompressedQuery(t *testing.T) {
+	// Two questions, the second of which reuses the end of the first one's name.
+	query := concat(
+		[]byte{0x9D, 0x5A, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		[]byte("\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01"),
+		[]byte("\x03def\xC0\x10\x00\x01\x00\x01"), // pointer to offset 16: longassdomainname.com
+	)
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	// Every name in the reply is written out in full.
+	want := concat(
+		[]byte{0x9D, 0x5A, 0x81, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+		[]byte("\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01"),
+		[]byte("\x03def\x11longassdomainname\x03com\x00\x00\x01\x00\x01"),
+		[]byte("\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08"),
+		[]byte("\x03def\x11longassdomainname\x03com\x00\x00\x01\x00\x01\x00\x00\x00\x3C\x00\x04\x08\x08\x08\x08"),
+	)
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondToQueryWithFullyCompressedQuestion(t *testing.T) {
+	// The second question is nothing but a pointer to the name of the first.
+	query := concat(
+		[]byte{0x00, 0x2A, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		[]byte("\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+		[]byte("\xC0\x0C\x00\x01\x00\x01"),
+	)
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	question := Question{Name: "codecrafters.io", Type: TypeA, Class: ClassIN}
+	answer := ResourceRecord{Name: "codecrafters.io", Type: TypeA, Class: ClassIN, TTL: 60, Data: []byte{8, 8, 8, 8}}
+
+	want := mustEncode(t, Message{
+		Header:    Header{ID: 42, QR: true},
+		Questions: []Question{question, question},
+		Answers:   []ResourceRecord{answer, answer},
+	})
+
+	if !bytes.Equal(response, want) {
+		t.Errorf("response = % x, want % x", response, want)
+	}
+}
+
+func TestRespondTruncatesReplyToCompressedQueryThatExpandsPastUDPLimit(t *testing.T) {
+	// One long name followed by 40 questions that are just a pointer to it:
+	// 286 bytes of query that would expand to several kilobytes of reply.
+	name := strings.Repeat("a", 30) + "." + strings.Repeat("b", 30) + ".example.com"
+
+	query := mustEncode(t, Message{
+		Header:    Header{ID: 5, QDCount: 41},
+		Questions: []Question{{Name: name, Type: TypeA, Class: ClassIN}},
+	})
+	query[5] = 41 // QDCOUNT, which Encode set to the single question above
+	for i := 0; i < 40; i++ {
+		query = append(query, 0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01)
+	}
+
+	response, err := respond(query)
+	if err != nil {
+		t.Fatalf("respond returned an error: %v", err)
+	}
+
+	if len(response) > maxUDPSize {
+		t.Fatalf("response is %d bytes, more than the %d that fit in a UDP packet", len(response), maxUDPSize)
+	}
+
+	got := mustParse(t, response)
+
+	if !got.Header.TC {
+		t.Error("response does not have the TC flag set")
+	}
+	if got.Header.ID != 5 || !got.Header.QR {
+		t.Errorf("response header = %+v, want ID 5 and QR set", got.Header)
+	}
+	for i, question := range got.Questions {
+		if want := (Question{Name: name, Type: TypeA, Class: ClassIN}); question != want {
+			t.Errorf("question %d = %+v, want %+v", i, question, want)
+		}
+	}
+	// Each question takes 79 bytes written out in full: 6 fit in 500 bytes.
+	if len(got.Questions) != 6 {
+		t.Errorf("response has %d questions, want 6", len(got.Questions))
+	}
+}
+
+func TestRespondWithFormatErrorToInvalidCompression(t *testing.T) {
+	header := []byte{0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	tests := []struct {
+		name  string
+		query []byte
+	}{
+		{name: "pointer to itself", query: concat(header, []byte("\xC0\x0C\x00\x01\x00\x01"))},
+		{name: "pointer to its own labels", query: concat(header, []byte("\x01a\xC0\x0C\x00\x01\x00\x01"))},
+		{name: "pointer forwards", query: concat(header, []byte("\xC0\x12\x00\x01\x00\x01\x01a\x00"))},
+		{name: "pointer past the end of the query", query: concat(header, []byte("\x01a\xC1\xFF\x00\x01\x00\x01"))},
+		{name: "pointer cut short", query: concat(header, []byte("\x01a\xC0"))},
+	}
+
+	want := mustEncode(t, Message{
+		Header: Header{ID: 0xABCD, QR: true, RD: true, RCode: RCodeFormatError},
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response, err := respond(tt.query)
+			if err != nil {
+				t.Fatalf("respond returned an error: %v", err)
+			}
+			if !bytes.Equal(response, want) {
+				t.Errorf("response = % x, want % x", response, want)
+			}
+		})
+	}
+}
+
 func TestRespondOnlyAnswersQuestionsAboutARecords(t *testing.T) {
 	const (
 		typeAAAA  = 28
@@ -671,6 +798,11 @@ func FuzzRespond(f *testing.F) {
 	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\xC0\x0C\x00\x01\x00\x01"))
 	f.Add(append([]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		bytes.Repeat([]byte{0x00, 0x00, 0x01, 0x00, 0x01}, 100)...))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00" +
+		"\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01\x03def\xC0\x10\x00\x01\x00\x01"))
+	f.Add(append([]byte("\x04\xD2\x01\x00\x00\x29\x00\x00\x00\x00\x00\x00"+
+		"\x3faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x03com\x00\x00\x01\x00\x01"),
+		bytes.Repeat([]byte{0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01}, 40)...))
 
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		response, err := respond(packet)

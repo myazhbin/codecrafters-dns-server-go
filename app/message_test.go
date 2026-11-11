@@ -492,6 +492,125 @@ func TestParseName(t *testing.T) {
 	}
 }
 
+func TestParseNameFollowsCompressionPointers(t *testing.T) {
+	// Offsets of the names in message:
+	//
+	//	 0  abc.longassdomainname.com, written out in full
+	//	27  def + pointer to offset 4 (longassdomainname.com)
+	//	33  pointer to offset 0 (abc.longassdomainname.com)
+	//	35  ghi + pointer to offset 27, which itself ends with a pointer
+	//	41  www + pointer to offset 22 (com)
+	//	47  pointer to offset 26, the zero byte that ends the first name
+	//	49  xyz + pointer to offset 26
+	//	55  pointer to offset 33, which is itself a pointer
+	//	57  end of the message
+	message := concat(
+		[]byte("\x03abc\x11longassdomainname\x03com\x00"),
+		[]byte("\x03def\xC0\x04"),
+		[]byte("\xC0\x00"),
+		[]byte("\x03ghi\xC0\x1B"),
+		[]byte("\x03www\xC0\x16"),
+		[]byte("\xC0\x1A"),
+		[]byte("\x03xyz\xC0\x1A"),
+		[]byte("\xC0\x21"),
+	)
+
+	tests := []struct {
+		name     string
+		offset   int
+		want     string
+		wantNext int
+	}{
+		{name: "no pointer", offset: 0, want: "abc.longassdomainname.com", wantNext: 27},
+		{name: "labels followed by a pointer", offset: 27, want: "def.longassdomainname.com", wantNext: 33},
+		{name: "pointer on its own", offset: 33, want: "abc.longassdomainname.com", wantNext: 35},
+		{name: "pointer to a name that ends with a pointer", offset: 35, want: "ghi.def.longassdomainname.com", wantNext: 41},
+		{name: "pointer to the last label of a name", offset: 41, want: "www.com", wantNext: 47},
+		{name: "pointer to the end of a name is the root", offset: 47, want: ".", wantNext: 49},
+		{name: "labels followed by a pointer to the end of a name", offset: 49, want: "xyz", wantNext: 55},
+		{name: "pointer to a pointer", offset: 55, want: "abc.longassdomainname.com", wantNext: 57},
+		{name: "name that starts in the middle of another", offset: 4, want: "longassdomainname.com", wantNext: 27},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, next, err := parseName(message, tt.offset)
+			if err != nil {
+				t.Fatalf("parseName returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseName() name = %q, want %q", got, tt.want)
+			}
+			if next != tt.wantNext {
+				t.Errorf("parseName() next offset = %d, want %d", next, tt.wantNext)
+			}
+		})
+	}
+}
+
+func TestParseNamePointerUsesAll14BitsOfItsOffset(t *testing.T) {
+	// A name at offset 0x0123, which needs bits from both bytes of a pointer.
+	message := make([]byte, 0x0123)
+	message = append(message, "\x01a\x02io\x00"...)
+	message = append(message, 0xC1, 0x23)
+
+	got, next, err := parseName(message, 0x0123+6)
+	if err != nil {
+		t.Fatalf("parseName returned an error: %v", err)
+	}
+	if got != "a.io" {
+		t.Errorf("parseName() name = %q, want %q", got, "a.io")
+	}
+	if want := 0x0123 + 8; next != want {
+		t.Errorf("parseName() next offset = %d, want %d", next, want)
+	}
+}
+
+func TestParseNameRejectsInvalidCompressionPointers(t *testing.T) {
+	label := "\x3f" + strings.Repeat("a", 63)
+
+	tests := []struct {
+		name   string
+		data   []byte
+		offset int
+	}{
+		{name: "pointer to itself", data: []byte("\xC0\x00")},
+		{name: "pointer to itself after other data", data: []byte("\x01a\x00\xC0\x03"), offset: 3},
+		{name: "pointer to the labels it follows", data: []byte("\x01a\xC0\x00")},
+		{name: "pointer to the middle of the labels it follows", data: []byte("\x01a\x01b\xC0\x02")},
+		{name: "pointer forwards", data: []byte("\xC0\x02\x01a\x00")},
+		{name: "pointer past the end of the message", data: []byte("\x01a\x00\xC0\x7F"), offset: 3},
+		{name: "two pointers to each other", data: []byte("\xC0\x02\xC0\x00"), offset: 2},
+		{
+			// The second name points back to the first, whose labels run on
+			// into the second name and its pointer.
+			name:   "loop through an earlier name",
+			data:   []byte("\x01a\x01b\xC0\x00"),
+			offset: 2,
+		},
+		{name: "pointer cut short", data: []byte("\x01a\x00\xC0"), offset: 3},
+		{name: "pointer cut short after labels", data: []byte("\x01a\xC0")},
+		{name: "pointer to a truncated name", data: []byte("\x05ab\xC0\x00"), offset: 3},
+		{name: "pointer to a reserved label type", data: []byte("\x80a\x00\xC0\x00"), offset: 3},
+		{name: "pointer to a label containing a dot", data: []byte("\x03a.b\x00\xC0\x00"), offset: 5},
+		{
+			// The first name is as long as a name may be, so anything in
+			// front of a pointer to it is too much.
+			name:   "pointer that makes the name too long",
+			data:   []byte(label + label + label + "\x3d" + strings.Repeat("b", 61) + "\x00" + "\x01c\xC0\x00"),
+			offset: 255,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, next, err := parseName(tt.data, tt.offset); err == nil {
+				t.Errorf("parseName() = %q with next offset %d, want an error", got, next)
+			}
+		})
+	}
+}
+
 func TestParseNameLongestName(t *testing.T) {
 	// Three 63-byte labels and one 61-byte label: exactly 255 bytes encoded.
 	label := strings.Repeat("a", 63)
@@ -530,7 +649,19 @@ func TestParseNameRejectsInvalidNames(t *testing.T) {
 		{name: "label length without any content", data: []byte("\x06")},
 		{name: "label type 01 is reserved", data: []byte("\x40a\x00")},
 		{name: "label type 10 is reserved", data: []byte("\x80a\x00")},
-		{name: "compression pointer", data: []byte("\x01a\x00\xC0\x00"), offset: 3},
+		{
+			// Read as a length, 0x40 would be a 64-byte label, one byte too long.
+			name: "label type 01 followed by as many bytes as it would count",
+			data: []byte("\x40" + strings.Repeat("a", 64) + "\x00"),
+		},
+		{
+			name: "label type 10 followed by as many bytes as it would count",
+			data: []byte("\x80" + strings.Repeat("a", 128) + "\x00"),
+		},
+		{
+			name: "largest value of label type 10 followed by as many bytes as it would count",
+			data: []byte("\xBF" + strings.Repeat("a", 191) + "\x00"),
+		},
 		{name: "label containing a dot", data: []byte("\x03a.b\x03com\x00")},
 		{
 			// 4*64 + 1 = 257 bytes encoded, two more than the limit.
@@ -1080,12 +1211,33 @@ func TestMessageEncodeWithLimit(t *testing.T) {
 			),
 		},
 		{
+			name:  "the questions fit exactly",
+			limit: 32,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				questionA, questionB,
+			),
+		},
+		{
 			name:  "a question that does not fit is dropped along with every answer",
 			limit: 31,
 			want: concat(
 				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 				questionA,
 			),
+		},
+		{
+			name:  "one question fits exactly",
+			limit: 22,
+			want: concat(
+				[]byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				questionA,
+			),
+		},
+		{
+			name:  "one byte short of the first question",
+			limit: 21,
+			want:  []byte{0x01, 0x02, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
 		{
 			name:  "room for the header alone",
@@ -1107,6 +1259,36 @@ func TestMessageEncodeWithLimit(t *testing.T) {
 				t.Errorf("EncodeWithLimit(%d) = % x, want % x", tt.limit, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMessageEncodeWithLimitDropsAnswersOnceQuestionIsDropped(t *testing.T) {
+	// The second question takes 70 bytes and does not fit, but the 20-byte
+	// answer would. It must be left out all the same: the answer section
+	// cannot start before the question section is complete.
+	message := Message{
+		Header: Header{ID: 0x0102, QR: true},
+		Questions: []Question{
+			{Name: "a.io", Type: TypeA, Class: ClassIN},
+			{Name: strings.Repeat("b", 61) + ".io", Type: TypeA, Class: ClassIN},
+		},
+		Answers: []ResourceRecord{
+			{Name: "a.io", Type: TypeA, Class: ClassIN, TTL: 1, Data: []byte{1, 1, 1, 1}},
+		},
+	}
+
+	got, err := message.EncodeWithLimit(60)
+	if err != nil {
+		t.Fatalf("EncodeWithLimit(60) returned an error: %v", err)
+	}
+
+	want := concat(
+		[]byte{0x01, 0x02, 0x82, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+	)
+
+	if !bytes.Equal(got, want) {
+		t.Errorf("EncodeWithLimit(60) = % x, want % x", got, want)
 	}
 }
 
@@ -1173,6 +1355,38 @@ func TestParseMessage(t *testing.T) {
 			},
 		},
 		{
+			name: "second question compressed with a pointer into the first",
+			data: concat(
+				[]byte{0x9D, 0x5A, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01"),
+				[]byte("\x03def\xC0\x10\x00\x01\x00\x01"), // pointer to offset 16: longassdomainname.com
+			),
+			want: Message{
+				Header: Header{ID: 0x9D5A, RD: true, QDCount: 2},
+				Questions: []Question{
+					{Name: "abc.longassdomainname.com", Type: TypeA, Class: ClassIN},
+					{Name: "def.longassdomainname.com", Type: TypeA, Class: ClassIN},
+				},
+			},
+		},
+		{
+			name: "questions that are nothing but a pointer to the first",
+			data: concat(
+				[]byte{0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\x02io\x00\x00\x01\x00\x01"),
+				[]byte("\xC0\x0C\x00\x1C\x00\x01"),
+				[]byte("\xC0\x0C\x00\x05\x00\x01"),
+			),
+			want: Message{
+				Header: Header{ID: 1, QDCount: 3},
+				Questions: []Question{
+					{Name: "a.io", Type: TypeA, Class: ClassIN},
+					{Name: "a.io", Type: 28, Class: ClassIN},
+					{Name: "a.io", Type: 5, Class: ClassIN},
+				},
+			},
+		},
+		{
 			name: "bytes after the last question are ignored",
 			data: concat(
 				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
@@ -1225,6 +1439,20 @@ func TestParseMessageRejectsInvalidMessages(t *testing.T) {
 			),
 		},
 		{
+			name: "question with a pointer to itself",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\xC0\x0C\x00\x01\x00\x01"),
+			),
+		},
+		{
+			name: "question with a pointer past the end of the message",
+			data: concat(
+				[]byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+				[]byte("\x01a\xC0\x40\x00\x01\x00\x01"),
+			),
+		},
+		{
 			name: "largest possible QDCOUNT with no questions",
 			data: []byte{0x04, 0xD2, 0x01, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
@@ -1248,6 +1476,10 @@ func FuzzParseMessage(f *testing.F) {
 	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\x01a\x02io\x00\x00\x01\x00\x01\x00\x00\x02\x00\x01"))
 	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\xC0\x0C\x00\x01\x00\x01"))
 	f.Add([]byte("\x04\xD2\x01\x00\xFF\xFF\x00\x00\x00\x00\x00\x00\x3f"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00" +
+		"\x03abc\x11longassdomainname\x03com\x00\x00\x01\x00\x01\x03def\xC0\x10\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\xC0\x0C\x00\x01\x00\x01"))
+	f.Add([]byte("\x04\xD2\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\xC0\x12\x00\x01\x00\x01\xC0\x0C\x00\x01\x00\x01"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		message, err := parseMessage(data)
