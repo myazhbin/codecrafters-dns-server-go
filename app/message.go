@@ -43,6 +43,17 @@ const (
 	maxNameLength = 255
 )
 
+// Operation codes, the kind of query a message carries (RFC 1035, section 4.1.1).
+const (
+	OpcodeQuery uint8 = 0 // A standard query.
+)
+
+// Response codes (RFC 1035, section 4.1.1).
+const (
+	RCodeNoError        uint8 = 0 // No error condition.
+	RCodeNotImplemented uint8 = 4 // The server does not support this kind of query.
+)
+
 // Record types (RFC 1035, section 3.2.2).
 const (
 	TypeA uint16 = 1 // An IPv4 host address.
@@ -108,6 +119,33 @@ func (h Header) appendTo(buf []byte) []byte {
 	buf = binary.BigEndian.AppendUint16(buf, h.ARCount)
 
 	return buf
+}
+
+// parseHeader decodes the header section found in the first 12 bytes of a DNS
+// message. Anything after the header is left alone.
+func parseHeader(data []byte) (Header, error) {
+	if len(data) < headerSize {
+		return Header{}, fmt.Errorf("message is %d bytes long, too short for its %d-byte header",
+			len(data), headerSize)
+	}
+
+	flags := binary.BigEndian.Uint16(data[2:])
+
+	return Header{
+		ID:      binary.BigEndian.Uint16(data[0:]),
+		QR:      flags&flagQR != 0,
+		Opcode:  uint8(flags >> opcodeShift & opcodeMask),
+		AA:      flags&flagAA != 0,
+		TC:      flags&flagTC != 0,
+		RD:      flags&flagRD != 0,
+		RA:      flags&flagRA != 0,
+		Z:       uint8(flags >> zShift & zMask),
+		RCode:   uint8(flags & rcodeMask),
+		QDCount: binary.BigEndian.Uint16(data[4:]),
+		ANCount: binary.BigEndian.Uint16(data[6:]),
+		NSCount: binary.BigEndian.Uint16(data[8:]),
+		ARCount: binary.BigEndian.Uint16(data[10:]),
+	}, nil
 }
 
 // Question is an entry in the question section of a DNS message (RFC 1035,

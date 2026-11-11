@@ -141,6 +141,145 @@ func TestHeaderAppendToKeepsExistingBytes(t *testing.T) {
 	}
 }
 
+func TestParseHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want Header
+	}{
+		{
+			name: "all zero",
+			data: []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{},
+		},
+		{
+			name: "query sent by dig",
+			data: []byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{ID: 1234, RD: true, QDCount: 1},
+		},
+		{
+			name: "ID is big-endian",
+			data: []byte{0xAB, 0xCD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{ID: 0xABCD},
+		},
+		{
+			name: "QR",
+			data: []byte{0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{QR: true},
+		},
+		{
+			name: "largest OPCODE",
+			data: []byte{0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{Opcode: 15},
+		},
+		{
+			name: "OPCODE 1",
+			data: []byte{0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{Opcode: 1},
+		},
+		{
+			name: "AA",
+			data: []byte{0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{AA: true},
+		},
+		{
+			name: "TC",
+			data: []byte{0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{TC: true},
+		},
+		{
+			name: "RD",
+			data: []byte{0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{RD: true},
+		},
+		{
+			name: "RA",
+			data: []byte{0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{RA: true},
+		},
+		{
+			name: "largest Z",
+			data: []byte{0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{Z: 7},
+		},
+		{
+			name: "largest RCODE",
+			data: []byte{0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			want: Header{RCode: 15},
+		},
+		{
+			name: "counts are big-endian and in QD, AN, NS, AR order",
+			data: []byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+			want: Header{QDCount: 0x0102, ANCount: 0x0304, NSCount: 0x0506, ARCount: 0x0708},
+		},
+		{
+			name: "every bit set",
+			data: []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+			want: Header{
+				ID: 0xFFFF, QR: true, Opcode: 15, AA: true, TC: true, RD: true, RA: true, Z: 7, RCode: 15,
+				QDCount: 0xFFFF, ANCount: 0xFFFF, NSCount: 0xFFFF, ARCount: 0xFFFF,
+			},
+		},
+		{
+			name: "a mix of fields",
+			data: []byte{0xBE, 0xEF, 0x91, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04},
+			want: Header{
+				ID: 0xBEEF, QR: true, Opcode: 2, RD: true, RCode: 4,
+				QDCount: 1, ANCount: 2, NSCount: 3, ARCount: 4,
+			},
+		},
+		{
+			name: "bytes after the header are ignored",
+			data: []byte("\x04\xD2\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x0ccodecrafters\x02io\x00\x00\x01\x00\x01"),
+			want: Header{ID: 1234, RD: true, QDCount: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseHeader(tt.data)
+			if err != nil {
+				t.Fatalf("parseHeader returned an error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseHeader() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseHeaderRejectsShortInput(t *testing.T) {
+	full := []byte{0x04, 0xD2, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+	// Every length from nothing at all up to one byte short of a header.
+	for length := 0; length < headerSize; length++ {
+		if got, err := parseHeader(full[:length]); err == nil {
+			t.Errorf("parseHeader of %d bytes = %+v, want an error", length, got)
+		}
+	}
+
+	if got, err := parseHeader(nil); err == nil {
+		t.Errorf("parseHeader(nil) = %+v, want an error", got)
+	}
+}
+
+// Parsing must be the exact inverse of encoding for every possible value of
+// the flags word, so that no bit is lost or moved on the way through.
+func TestParseHeaderRoundTripsEveryFlagsWord(t *testing.T) {
+	for flags := 0; flags <= 0xFFFF; flags++ {
+		data := []byte{0x12, 0x34, byte(flags >> 8), byte(flags), 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04}
+
+		header, err := parseHeader(data)
+		if err != nil {
+			t.Fatalf("flags %#04x: parseHeader returned an error: %v", flags, err)
+		}
+
+		if got := header.appendTo(nil); !bytes.Equal(got, data) {
+			t.Fatalf("flags %#04x: parsed as %+v, which encodes back to % x, want % x", flags, header, got, data)
+		}
+	}
+}
+
 func TestAppendName(t *testing.T) {
 	tests := []struct {
 		name   string
